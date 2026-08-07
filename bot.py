@@ -857,26 +857,51 @@ async def notify_success(payment_row):
 async def send_customer_success(payment_row):
     tg_id = payment_row["telegram_id"]
     product_key = payment_row["product_key"]
+    payment_id = html.escape(payment_row["yookassa_payment_id"])
 
     if product_key == "energy":
         if YANDEX_DISK_URL:
-            text = f"""✅ <b>Платёж принят.</b>
+            text = f"""✅ <b>Платёж принят!</b>
 
-Спасибо за покупку энергокомплекса.
+🆔 <b>Payment ID:</b>
+<code>{payment_id}</code>
 
-♾️ Доступ к тренировкам:
+Спасибо за покупку энергокомплекса!
+
+📧 Чек будет отправлен Вам на указанную электронную почту в ближайшее время.
+
+♾️ <b>Доступ к тренировкам:</b>
 {html.escape(YANDEX_DISK_URL)}
 
-Если возникнут вопросы: @veranikkiri"""
+Если возникнут вопросы, пожалуйста, укажите Payment ID — так я смогу быстрее найти Ваш платёж.
+
+Поддержка: @veranikkiri"""
         else:
-            text = """✅ <b>Платёж принят.</b>
+            text = f"""✅ <b>Платёж принят!</b>
 
-Спасибо за покупку энергокомплекса.
-Ссылка на материалы временно не настроена. Напишите @veranikkiri — доступ будет отправлен вручную."""
+🆔 <b>Payment ID:</b>
+<code>{payment_id}</code>
+
+Спасибо за покупку энергокомплекса!
+
+📧 Чек будет отправлен Вам на указанную электронную почту в ближайшее время.
+
+Ссылка на материалы временно не настроена. Напишите @veranikkiri, и я отправлю доступ вручную.
+
+Если возникнут вопросы, пожалуйста, укажите Payment ID."""
     else:
-        text = """✅ <b>Платёж принят.</b>
+        text = f"""✅ <b>Платёж принят!</b>
 
-В ближайшее время я с Вами свяжусь для уточнения графика индивидуальных тренировок."""
+🆔 <b>Payment ID:</b>
+<code>{payment_id}</code>
+
+📧 Чек будет отправлен Вам на указанную электронную почту в ближайшее время.
+
+В ближайшее время я с Вами свяжусь для согласования графика индивидуальных тренировок.
+
+Если возникнут вопросы, пожалуйста, укажите Payment ID — так я смогу быстрее найти Ваш платёж.
+
+Поддержка: @veranikkiri"""
 
     try:
         await bot.send_message(
@@ -888,9 +913,10 @@ async def send_customer_success(payment_row):
         )
         await mark_access_sent(payment_row["yookassa_payment_id"])
     except Exception:
-        logger.exception("Could not send customer success for payment %s", payment_row["yookassa_payment_id"])
-
-
+        logger.exception(
+            "Could not send customer success for payment %s",
+            payment_row["yookassa_payment_id"],
+        )
 # ============================================================
 # WEBHOOK SERVER
 # ============================================================
