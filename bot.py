@@ -476,7 +476,21 @@ async def mark_receipt_sent(payment_id: str):
         )
         await db.commit()
         return cur.rowcount > 0
+async def clear_payments():
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Узнаём, сколько записей было удалено
+        cur = await db.execute("SELECT COUNT(*) FROM payments")
+        deleted_count = (await cur.fetchone())[0]
 
+        # Очищаем таблицу
+        await db.execute("DELETE FROM payments")
+
+        # Сбрасываем счётчик AUTOINCREMENT
+        await db.execute("DELETE FROM sqlite_sequence WHERE name='payments'")
+
+        await db.commit()
+
+        return deleted_count
 
 # ============================================================
 # RATE LIMIT
@@ -1031,8 +1045,58 @@ async def receipt_handler(message: Message):
         f"Payment ID: <code>{html.escape(payment_id)}</code>",
         parse_mode=ParseMode.HTML,
     )
+@router.message(Command("clearpayments"))
+async def clear_payments_command(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🗑 Да, очистить",
+                    callback_data="confirm_clear_payments",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data="cancel_clear_payments",
+                )
+            ],
+        ]
+    )
+
+    await message.answer(
+        "⚠️ <b>Вы уверены?</b>\n\n"
+        "Будут удалены <b>ВСЕ</b> записи о покупках.\n"
+        "Это действие нельзя отменить.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+@router.callback_query(F.data == "confirm_clear_payments")
+async def confirm_clear_payments(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+
+    deleted_count = await clear_payments()
+
+    await callback.message.edit_text(
+        f"✅ База покупок очищена.\n\n"
+        f"Удалено записей: <b>{deleted_count}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    await callback.answer("Готово")
 
 
+@router.callback_query(F.data == "cancel_clear_payments")
+async def cancel_clear_payments(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "❌ Очистка отменена."
+    )
+    await callback.answer()
 @router.message()
 async def fallback_handler(message: Message):
     # Avoid noisy responses to arbitrary spam while preserving navigation.
