@@ -838,29 +838,31 @@ async def my_purchases_handler(message: Message):
         return
 
     parts = ["📄 <b>Мои покупки</b>"]
+
     for index, row in enumerate(rows, start=1):
         paid_time = format_moscow_time(row["paid_at"])
         receipt_status = "✅ отправлен" if row["receipt_sent"] else "⏳ ожидает отправки"
 
         item = (
-            f"\\n<b>{index}. {html.escape(row['product_title'])}</b>\\n"
-            f"💰 {row['amount']} {html.escape(row['currency'])}\\n"
-            f"🕒 {html.escape(paid_time)}\\n"
-            f"🆔 Payment ID: <code>{html.escape(row['yookassa_payment_id'])}</code>\\n"
+            f"\n<b>{index}. {html.escape(row['product_title'])}</b>\n"
+            f"💰 {row['amount']} {html.escape(row['currency'])}\n"
+            f"🕒 {html.escape(paid_time)}\n"
+            f"🆔 <b>Payment ID</b>\n"
+            f"<code>{html.escape(row['yookassa_payment_id'])}</code>\n"
             f"🧾 Чек: {receipt_status}"
         )
 
         if row["product_key"] == "energy" and YANDEX_DISK_URL:
-            item += f'\\n♾️ <a href="{html.escape(YANDEX_DISK_URL)}">Открыть тренировки</a>'
+            item += f'\n♾️ <a href="{html.escape(YANDEX_DISK_URL)}">Открыть тренировки</a>'
 
         parts.append(item)
 
     parts.append(
-        "\\nЕсли возник вопрос по оплате, отправьте в поддержку соответствующий Payment ID."
+        "\nЕсли возник вопрос по оплате, отправьте в поддержку соответствующий Payment ID."
     )
 
     await message.answer(
-        "\\n".join(parts),
+        "\n".join(parts),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
         reply_markup=persistent_keyboard(),
