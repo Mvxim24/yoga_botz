@@ -636,7 +636,7 @@ async def start_handler(message: Message, state: FSMContext):
     # persistent keyboard is attached to the first message;
     # the inline product menu is a separate bot message and then edited in-place.
     await message.answer(
-        "🌿 Yoga Lovers Club",
+        "Yoga Lovers Club",
         reply_markup=persistent_keyboard(),
     )
     await message.answer(
@@ -705,7 +705,7 @@ async def email_handler(query: CallbackQuery, state: FSMContext):
     text = legal_text(key) + (
         "\n\n<b>Перед оплатой укажите свой email.📩</b>\n"
         "Он нужен для идентификации покупки и отправки чека.\n\n"
-        "👇Отправьте email одним сообщением:👇"
+        "Отправьте email одним сообщением:👇"
     )
     await safe_edit(
         query,
