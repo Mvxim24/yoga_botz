@@ -57,7 +57,8 @@ OFFER_URL = os.getenv("OFFER_URL", "https://example.com/offer").strip()
 
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", 8080))
-DB_PATH = os.getenv("DB_PATH", "yoga_bot.sqlite3")
+DATA_DIR = os.getenv("DATA_DIR", ".").strip() or "."
+DB_PATH = os.getenv("DB_PATH", str(Path(DATA_DIR) / "yoga_bot.sqlite3"))
 
 # If your hosting passes the real client IP via X-Forwarded-For, set true.
 # We still verify the payment directly via YooKassa API, so IP filtering is
@@ -191,7 +192,10 @@ def persistent_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="👤 Обо мне"),
                 KeyboardButton(text="💬 Поддержка"),
             ],
-            [KeyboardButton(text="🎁 Пробная тренировка")],
+            [
+                KeyboardButton(text="🎁 Пробная тренировка"),
+                KeyboardButton(text="📄 Мои покупки"),
+            ],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -244,6 +248,14 @@ def payment_keyboard(url: str, product_key: str) -> InlineKeyboardMarkup:
     )
 
 
+def after_purchase_keyboard(product_key: str) -> InlineKeyboardMarkup:
+    rows = []
+    if product_key == "energy" and YANDEX_DISK_URL:
+        rows.append([InlineKeyboardButton(text="🧘 Открыть тренировки", url=YANDEX_DISK_URL)])
+    rows.append([InlineKeyboardButton(text="💬 Написать Вере", url="https://t.me/veranikkiri")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 # ============================================================
 # DATABASE
 # ============================================================
@@ -275,7 +287,9 @@ CREATE TABLE IF NOT EXISTS payments (
     created_at TEXT NOT NULL,
     paid_at TEXT,
     notification_sent INTEGER NOT NULL DEFAULT 0,
-    access_sent INTEGER NOT NULL DEFAULT 0
+    access_sent INTEGER NOT NULL DEFAULT 0,
+    receipt_sent INTEGER NOT NULL DEFAULT 0,
+    receipt_sent_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_payments_tg ON payments(telegram_id);
@@ -287,8 +301,25 @@ def utcnow_iso() -> str:
 
 
 async def init_db():
+    db_parent = Path(DB_PATH).parent
+    db_parent.mkdir(parents=True, exist_ok=True)
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(CREATE_SCHEMA)
+
+        # Lightweight migration for databases created by older bot versions.
+        cur = await db.execute("PRAGMA table_info(payments)")
+        existing_columns = {row[1] for row in await cur.fetchall()}
+
+        if "receipt_sent" not in existing_columns:
+            await db.execute(
+                "ALTER TABLE payments ADD COLUMN receipt_sent INTEGER NOT NULL DEFAULT 0"
+            )
+        if "receipt_sent_at" not in existing_columns:
+            await db.execute(
+                "ALTER TABLE payments ADD COLUMN receipt_sent_at TEXT"
+            )
+
         await db.commit()
 
 
@@ -399,6 +430,52 @@ async def paid_buyers_rows():
             """
         )
         return await cur.fetchall()
+
+
+async def user_paid_purchases(telegram_id: int, limit: int = 10):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT paid_at, telegram_id, email, product_key, product_title,
+                   amount, currency, yookassa_payment_id, receipt_sent
+            FROM payments
+            WHERE telegram_id=? AND status='succeeded'
+            ORDER BY paid_at DESC
+            LIMIT ?
+            """,
+            (telegram_id, limit),
+        )
+        return await cur.fetchall()
+
+
+async def successful_payments_full():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT paid_at, product_key, product_title, amount, currency,
+                   yookassa_payment_id, receipt_sent
+            FROM payments
+            WHERE status='succeeded'
+            ORDER BY paid_at DESC
+            """
+        )
+        return await cur.fetchall()
+
+
+async def mark_receipt_sent(payment_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            UPDATE payments
+            SET receipt_sent=1, receipt_sent_at=?
+            WHERE yookassa_payment_id=? AND status='succeeded'
+            """,
+            (utcnow_iso(), payment_id),
+        )
+        await db.commit()
+        return cur.rowcount > 0
 
 
 # ============================================================
@@ -735,6 +812,47 @@ async def trial_handler(message: Message):
     )
 
 
+@router.message(F.text == "📄 Мои покупки")
+async def my_purchases_handler(message: Message):
+    rows = await user_paid_purchases(message.from_user.id)
+
+    if not rows:
+        await message.answer(
+            "У Вас пока нет оплаченных покупок.",
+            reply_markup=persistent_keyboard(),
+        )
+        return
+
+    parts = ["📄 <b>Мои покупки</b>"]
+    for index, row in enumerate(rows, start=1):
+        paid_time = format_moscow_time(row["paid_at"])
+        receipt_status = "✅ отправлен" if row["receipt_sent"] else "⏳ ожидает отправки"
+
+        item = (
+            f"\\n<b>{index}. {html.escape(row['product_title'])}</b>\\n"
+            f"💰 {row['amount']} {html.escape(row['currency'])}\\n"
+            f"🕒 {html.escape(paid_time)}\\n"
+            f"🆔 Payment ID: <code>{html.escape(row['yookassa_payment_id'])}</code>\\n"
+            f"🧾 Чек: {receipt_status}"
+        )
+
+        if row["product_key"] == "energy" and YANDEX_DISK_URL:
+            item += f'\\n♾️ <a href="{html.escape(YANDEX_DISK_URL)}">Открыть тренировки</a>'
+
+        parts.append(item)
+
+    parts.append(
+        "\\nЕсли возник вопрос по оплате, отправьте в поддержку соответствующий Payment ID."
+    )
+
+    await message.answer(
+        "\\n".join(parts),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=persistent_keyboard(),
+    )
+
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -795,11 +913,122 @@ async def buyers_handler(message: Message):
 async def stats_handler(message: Message):
     if not is_admin(message.from_user.id):
         return
-    rows = await paid_buyers_rows()
-    total = sum(int(row["amount"]) for row in rows)
+
+    from zoneinfo import ZoneInfo
+    now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
+    rows = await successful_payments_full()
+
+    today_rows = []
+    month_rows = []
+    product_counts = {}
+
+    for row in rows:
+        if not row["paid_at"]:
+            continue
+        try:
+            paid_dt = datetime.fromisoformat(row["paid_at"]).astimezone(
+                ZoneInfo("Europe/Moscow")
+            )
+        except Exception:
+            continue
+
+        if paid_dt.date() == now_msk.date():
+            today_rows.append(row)
+
+        if paid_dt.year == now_msk.year and paid_dt.month == now_msk.month:
+            month_rows.append(row)
+            product_counts[row["product_title"]] = (
+                product_counts.get(row["product_title"], 0) + 1
+            )
+
+    today_sum = sum(int(r["amount"]) for r in today_rows)
+    month_sum = sum(int(r["amount"]) for r in month_rows)
+    all_sum = sum(int(r["amount"]) for r in rows)
+    pending_receipts = sum(1 for r in rows if not r["receipt_sent"])
+
+    breakdown = "\\n".join(
+        f"• {html.escape(title)} — {count}"
+        for title, count in sorted(product_counts.items())
+    ) or "• продаж пока нет"
+
+    text = f"""📊 <b>Статистика</b>
+
+<b>Сегодня</b>
+Продаж: {len(today_rows)}
+Сумма: {today_sum:,} ₽
+
+<b>Текущий месяц</b>
+Продаж: {len(month_rows)}
+Сумма: {month_sum:,} ₽
+
+{breakdown}
+
+<b>За всё время</b>
+Продаж: {len(rows)}
+Сумма: {all_sum:,} ₽
+
+🧾 Чеков ожидают отметки об отправке: {pending_receipts}""".replace(",", " ")
+
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("receipt"))
+async def receipt_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        await message.answer(
+            "Использование:\\n<code>/receipt PAYMENT_ID</code>\\n\\n"
+            "Команда отмечает чек как отправленный и уведомляет покупателя в Telegram.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    payment_id = parts[1].strip()
+    payment_row = await get_payment(payment_id)
+
+    if not payment_row or payment_row["status"] != "succeeded":
+        await message.answer("Успешный платёж с таким Payment ID не найден.")
+        return
+
+    if payment_row["receipt_sent"]:
+        await message.answer("Для этого платежа чек уже отмечен как отправленный.")
+        return
+
+    updated = await mark_receipt_sent(payment_id)
+    if not updated:
+        await message.answer("Не удалось обновить запись платежа.")
+        return
+
+    try:
+        await bot.send_message(
+            payment_row["telegram_id"],
+            f"""🧾 <b>Чек отправлен</b>
+
+Чек по Вашей покупке отправлен на электронную почту:
+<b>{html.escape(payment_row["email"])}</b>
+
+🆔 Payment ID:
+<code>{html.escape(payment_id)}</code>
+
+Если письмо не пришло, проверьте папку «Спам» или напишите @veranikkiri.""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=persistent_keyboard(),
+        )
+    except Exception:
+        logger.exception("Could not notify customer that receipt was sent: %s", payment_id)
+        await message.answer(
+            "Чек отмечен как отправленный, но Telegram-уведомление покупателю доставить не удалось."
+        )
+        return
+
     await message.answer(
-        f"Успешных оплат: {len(rows)}\n"
-        f"Общая сумма: {total:,} ₽".replace(",", " ")
+        f"✅ Чек отмечен как отправленный.\\n"
+        f"Покупатель уведомлён.\\n"
+        f"Payment ID: <code>{html.escape(payment_id)}</code>",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -840,7 +1069,7 @@ async def notify_success(payment_row):
 📧 Email: <b>{html.escape(payment_row["email"])}</b>
 💳 Payment ID: <code>{html.escape(payment_row["yookassa_payment_id"])}</code>
 
-🧾❗ <b>ВАЖНО: СФОРМИРОВАТЬ ЧЕК В «МОЙ НАЛОГ» И ОБЯЗАТЕЛЬНО ОТПРАВИТЬ ЕГО ПОКУПАТЕЛЮ.</b>"""
+🧾❗ <b>ВАЖНО: СФОРМИРОВАТЬ ЧЕК В «МОЙ НАЛОГ» И ОБЯЗАТЕЛЬНО ОТПРАВИТЬ ЕГО ПОКУПАТЕЛЮ.</b>\n\nПосле отправки отметьте это командой:\n<code>/receipt {html.escape(payment_row["yookassa_payment_id"])}</code>"""
 
     destinations = set(ADMIN_IDS)
     destinations.add(ADMIN_GROUP_ID)
@@ -873,9 +1102,7 @@ async def send_customer_success(payment_row):
 ♾️ <b>Доступ к тренировкам:</b>
 {html.escape(YANDEX_DISK_URL)}
 
-Если возникнут вопросы, пожалуйста, укажите Payment ID — так я смогу быстрее найти Ваш платёж.
-
-Поддержка: @veranikkiri"""
+Если возникнут вопросы, укажите Payment ID — так я смогу быстрее найти Ваш платёж."""
         else:
             text = f"""✅ <b>Платёж принят!</b>
 
@@ -886,9 +1113,7 @@ async def send_customer_success(payment_row):
 
 📧 Чек будет отправлен Вам на указанную электронную почту в ближайшее время.
 
-Ссылка на материалы временно не настроена. Напишите @veranikkiri, и я отправлю доступ вручную.
-
-Если возникнут вопросы, пожалуйста, укажите Payment ID."""
+Ссылка на материалы временно не настроена. Напишите @veranikkiri, и я отправлю доступ вручную."""
     else:
         text = f"""✅ <b>Платёж принят!</b>
 
@@ -899,9 +1124,7 @@ async def send_customer_success(payment_row):
 
 В ближайшее время я с Вами свяжусь для согласования графика индивидуальных тренировок.
 
-Если возникнут вопросы, пожалуйста, укажите Payment ID — так я смогу быстрее найти Ваш платёж.
-
-Поддержка: @veranikkiri"""
+Если возникнут вопросы, укажите Payment ID — так я смогу быстрее найти Ваш платёж."""
 
     try:
         await bot.send_message(
@@ -909,7 +1132,7 @@ async def send_customer_success(payment_row):
             text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
-            reply_markup=persistent_keyboard(),
+            reply_markup=after_purchase_keyboard(product_key),
         )
         await mark_access_sent(payment_row["yookassa_payment_id"])
     except Exception:
@@ -917,6 +1140,8 @@ async def send_customer_success(payment_row):
             "Could not send customer success for payment %s",
             payment_row["yookassa_payment_id"],
         )
+
+
 # ============================================================
 # WEBHOOK SERVER
 # ============================================================
