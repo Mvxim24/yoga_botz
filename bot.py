@@ -56,7 +56,7 @@ PRIVACY_URL = os.getenv("PRIVACY_URL", "https://example.com/privacy").strip()
 OFFER_URL = os.getenv("OFFER_URL", "https://example.com/offer").strip()
 
 HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", "8080"))
+PORT = int(os.environ.get("PORT", 8080))
 DB_PATH = os.getenv("DB_PATH", "yoga_bot.sqlite3")
 
 # If your hosting passes the real client IP via X-Forwarded-For, set true.
