@@ -1008,7 +1008,8 @@ async def receipt_handler(message: Message):
             f"""🧾 <b>Чек отправлен</b>
 
 Чек по Вашей покупке отправлен на электронную почту:
-<b>{html.escape(payment_row["email"])}</b>
+📧 <b>Email</b>
+<code>{html.escape(payment_row["email"])}</code>
 
 🆔 Payment ID:
 <code>{html.escape(payment_id)}</code>
@@ -1066,8 +1067,12 @@ async def notify_success(payment_row):
 👤 Имя: {html.escape(name)}
 🔗 Username: {html.escape(username)}
 🆔 Telegram ID: <code>{payment_row["telegram_id"]}</code>
-📧 Email: <b>{html.escape(payment_row["email"])}</b>
-💳 Payment ID: <code>{html.escape(payment_row["yookassa_payment_id"])}</code>
+
+📧 <b>Email</b>
+<code>{html.escape(payment_row["email"])}</code>
+
+💳 <b>Payment ID</b>
+<code>{html.escape(payment_row["yookassa_payment_id"])}</code>
 
 🧾❗ <b>ВАЖНО: СФОРМИРОВАТЬ ЧЕК В «МОЙ НАЛОГ» И ОБЯЗАТЕЛЬНО ОТПРАВИТЬ ЕГО ПОКУПАТЕЛЮ.</b>\n\nПосле отправки отметьте это командой:\n<code>/receipt {html.escape(payment_row["yookassa_payment_id"])}</code>"""
 
