@@ -179,7 +179,7 @@ def legal_text(product_key: str) -> str:
 После оплаты будет предоставлен доступ:
 {access}
 
-ℹ️ Нажимая <b>«Перейти к оплате 💳»</b>, Вы подтверждаете, что ознакомились и принимаете условия <a href="{html.escape(OFFER_URL)}">Публичной оферты</a>, ознакомились с <a href="{html.escape(PRIVACY_URL)}">Политикой конфиденциальности</a> и даёте <a href="{html.escape(CONSENT_URL)}">Согласие на обработку персональных данных</a>.
+ℹ️ Нажимая <b>«✅ Согласен и продолжить»</b>, Вы подтверждаете, что ознакомились и принимаете условия <a href="{html.escape(OFFER_URL)}">Публичной оферты</a>, ознакомились с <a href="{html.escape(PRIVACY_URL)}">Политикой конфиденциальности</a> и даёте <a href="{html.escape(CONSENT_URL)}">Согласие на обработку персональных данных</a>.
 
 <a href="{html.escape(MARKETING_URL)}">Согласие на получение рекламных и информационных сообщений</a> является добровольным."""
 
@@ -952,8 +952,9 @@ async def receive_email(message: Message, state: FSMContext):
         )
         return
 
-    # Remove the user's email message when Telegram permissions allow it,
-    # so the checkout visually remains as one bot message.
+    # Remove the user's email message when Telegram permissions allow it.
+    # Then move the checkout to the bottom of the chat so the payment button
+    # is immediately visible after email entry.
     with suppress(Exception):
         await message.delete()
 
@@ -962,21 +963,21 @@ async def receive_email(message: Message, state: FSMContext):
         "Нажмите кнопку ниже — откроется защищённая страница ЮKassa."
     )
 
-    try:
-        await bot.edit_message_text(
+    # Delete the previous checkout window so the chat keeps only one
+    # active payment card instead of accumulating duplicate messages.
+    with suppress(Exception):
+        await bot.delete_message(
             chat_id=menu_chat_id,
             message_id=menu_message_id,
-            text=text,
-            reply_markup=payment_keyboard(payment_url, key),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
         )
-    except Exception:
-        logger.exception("Failed to edit checkout message")
-        await message.answer(
-            "Платёж создан:",
-            reply_markup=payment_keyboard(payment_url, key),
-        )
+
+    await bot.send_message(
+        chat_id=menu_chat_id,
+        text=text,
+        reply_markup=payment_keyboard(payment_url, key),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
     await state.clear()
 
