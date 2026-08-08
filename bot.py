@@ -268,6 +268,7 @@ CREATE TABLE IF NOT EXISTS users (
     telegram_id INTEGER PRIMARY KEY,
     username TEXT,
     full_name TEXT,
+    service_message_id INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -308,6 +309,13 @@ async def init_db():
         await db.executescript(CREATE_SCHEMA)
 
         # Lightweight migration for databases created by older bot versions.
+        cur = await db.execute("PRAGMA table_info(users)")
+        existing_user_columns = {row[1] for row in await cur.fetchall()}
+        if "service_message_id" not in existing_user_columns:
+            await db.execute(
+                "ALTER TABLE users ADD COLUMN service_message_id INTEGER"
+            )
+
         cur = await db.execute("PRAGMA table_info(payments)")
         existing_columns = {row[1] for row in await cur.fetchall()}
 
@@ -338,6 +346,25 @@ async def upsert_user(message_or_query_user):
               updated_at=excluded.updated_at
             """,
             (user.id, user.username, full_name, now, now),
+        )
+        await db.commit()
+
+
+async def get_service_message_id(telegram_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT service_message_id FROM users WHERE telegram_id=?",
+            (telegram_id,),
+        )
+        row = await cur.fetchone()
+        return row[0] if row and row[0] else None
+
+
+async def set_service_message_id(telegram_id: int, message_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET service_message_id=?, updated_at=? WHERE telegram_id=?",
+            (message_id, utcnow_iso(), telegram_id),
         )
         await db.commit()
 
@@ -642,17 +669,66 @@ async def safe_edit(query: CallbackQuery, text: str, keyboard: InlineKeyboardMar
             raise
 
 
+async def show_service_panel(
+    message: Message,
+    text: str,
+    *,
+    disable_web_page_preview: bool = True,
+):
+    """Show bottom-menu content in one persistent bot message."""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    # ReplyKeyboard buttons arrive as normal user messages.
+    # Delete them when Telegram allows it so the chat stays clean.
+    with suppress(Exception):
+        await message.delete()
+
+    service_message_id = await get_service_message_id(user_id)
+
+    if service_message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=service_message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+            return
+        except Exception as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            logger.info(
+                "Could not edit service panel for user %s; creating a new one",
+                user_id,
+            )
+
+    sent = await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=disable_web_page_preview,
+        reply_markup=persistent_keyboard(),
+    )
+    await set_service_message_id(user_id, sent.message_id)
+
+
 @router.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     await state.clear()
     await upsert_user(message.from_user)
 
-    # persistent keyboard is attached to the first message;
-    # the inline product menu is a separate bot message and then edited in-place.
-    await message.answer(
-        "Yoga Lovers Club",
+    # First bot message is a separate persistent window for the bottom menu.
+    service_message = await message.answer(
+        "🌿 <b>Yoga Lovers Club</b>\n\n"
+        "Выберите нужный раздел в меню ниже 👇",
+        parse_mode=ParseMode.HTML,
         reply_markup=persistent_keyboard(),
     )
+    await set_service_message_id(message.from_user.id, service_message.message_id)
+
+    # Product menu remains a separate message and keeps its existing in-place navigation.
     await message.answer(
         START_TEXT,
         reply_markup=products_keyboard(),
@@ -804,26 +880,17 @@ async def receive_email(message: Message, state: FSMContext):
 
 @router.message(F.text == "👤 Обо мне")
 async def about_handler(message: Message):
-    await message.answer(
-        ABOUT_TEXT,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-        reply_markup=persistent_keyboard(),
-    )
+    await show_service_panel(message, ABOUT_TEXT)
 
 
 @router.message(F.text == "💬 Поддержка")
 async def support_handler(message: Message):
-    await message.answer(SUPPORT_TEXT, reply_markup=persistent_keyboard())
+    await show_service_panel(message, SUPPORT_TEXT)
 
 
 @router.message(F.text == "🎁 Пробная тренировка")
 async def trial_handler(message: Message):
-    await message.answer(
-        TRIAL_TEXT,
-        parse_mode=ParseMode.HTML,
-        reply_markup=persistent_keyboard(),
-    )
+    await show_service_panel(message, TRIAL_TEXT)
 
 
 @router.message(F.text == "📄 Мои покупки")
@@ -831,9 +898,10 @@ async def my_purchases_handler(message: Message):
     rows = await user_paid_purchases(message.from_user.id)
 
     if not rows:
-        await message.answer(
+        await show_service_panel(
+            message,
+            "📄 <b>Мои покупки</b>\n\n"
             "У Вас пока нет оплаченных покупок.",
-            reply_markup=persistent_keyboard(),
         )
         return
 
@@ -853,19 +921,21 @@ async def my_purchases_handler(message: Message):
         )
 
         if row["product_key"] == "energy" and YANDEX_DISK_URL:
-            item += f'\n♾️ <a href="{html.escape(YANDEX_DISK_URL)}">Открыть тренировки</a>'
+            item += (
+                f'\n♾️ <a href="{html.escape(YANDEX_DISK_URL)}">'
+                "Открыть тренировки</a>"
+            )
 
         parts.append(item)
 
     parts.append(
-        "\nЕсли возник вопрос по оплате, отправьте в поддержку соответствующий Payment ID."
+        "\nЕсли возник вопрос по оплате, отправьте в поддержку "
+        "соответствующий Payment ID."
     )
 
-    await message.answer(
+    await show_service_panel(
+        message,
         "\n".join(parts),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-        reply_markup=persistent_keyboard(),
     )
 
 
