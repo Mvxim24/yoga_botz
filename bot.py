@@ -309,7 +309,9 @@ CREATE TABLE IF NOT EXISTS payments (
     notification_sent INTEGER NOT NULL DEFAULT 0,
     access_sent INTEGER NOT NULL DEFAULT 0,
     receipt_sent INTEGER NOT NULL DEFAULT 0,
-    receipt_sent_at TEXT
+    receipt_sent_at TEXT,
+    marketing_consent INTEGER,
+    marketing_consent_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_payments_tg ON payments(telegram_id);
@@ -355,6 +357,14 @@ async def init_db():
         if "receipt_sent_at" not in existing_columns:
             await db.execute(
                 "ALTER TABLE payments ADD COLUMN receipt_sent_at TEXT"
+            )
+        if "marketing_consent" not in existing_columns:
+            await db.execute(
+                "ALTER TABLE payments ADD COLUMN marketing_consent INTEGER"
+            )
+        if "marketing_consent_at" not in existing_columns:
+            await db.execute(
+                "ALTER TABLE payments ADD COLUMN marketing_consent_at TEXT"
             )
 
         await db.commit()
@@ -429,12 +439,25 @@ async def insert_pending_payment(
 ):
     product = PRODUCTS[product_key]
     async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT marketing_consent, marketing_consent_at
+            FROM users
+            WHERE telegram_id=?
+            """,
+            (telegram_id,),
+        )
+        consent_row = await cur.fetchone()
+        marketing_consent = consent_row[0] if consent_row else None
+        marketing_consent_at = consent_row[1] if consent_row else None
+
         await db.execute(
             """
             INSERT OR IGNORE INTO payments(
                 yookassa_payment_id, telegram_id, username, full_name, email,
-                product_key, product_title, amount, currency, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RUB', 'pending', ?)
+                product_key, product_title, amount, currency, status, created_at,
+                marketing_consent, marketing_consent_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RUB', 'pending', ?, ?, ?)
             """,
             (
                 payment_id,
@@ -446,6 +469,8 @@ async def insert_pending_payment(
                 product["title"],
                 product["price"],
                 utcnow_iso(),
+                marketing_consent,
+                marketing_consent_at,
             ),
         )
         await db.commit()
@@ -500,7 +525,8 @@ async def paid_buyers_rows():
         cur = await db.execute(
             """
             SELECT paid_at, telegram_id, full_name, username, email,
-                   product_title, amount, currency, yookassa_payment_id
+                   product_title, amount, currency, yookassa_payment_id,
+                   marketing_consent, marketing_consent_at
             FROM payments
             WHERE status='succeeded'
             ORDER BY paid_at DESC
@@ -771,8 +797,7 @@ async def start_handler(message: Message, state: FSMContext):
 
     # First bot message is a separate persistent window for the bottom menu.
     service_message = await message.answer(
-        "🌿 <b>Yoga Lovers Club</b>\n\n"
-        "Выберите нужный раздел в меню ниже 👇",
+        "🌿 <b>Yoga Lovers Club</b>\n\n",
         parse_mode=ParseMode.HTML,
         reply_markup=persistent_keyboard(),
     )
@@ -1048,6 +1073,8 @@ async def buyers_handler(message: Message):
                 "Сумма",
                 "Валюта",
                 "YooKassa payment ID",
+                "Рекламная рассылка разрешена",
+                "Дата согласия/отказа UTC",
             ]
         )
         for row in rows:
@@ -1062,6 +1089,8 @@ async def buyers_handler(message: Message):
                     row["amount"],
                     row["currency"],
                     row["yookassa_payment_id"],
+                    "ДА" if row["marketing_consent"] == 1 else "НЕТ",
+                    row["marketing_consent_at"] or "",
                 ]
             )
 
@@ -1110,7 +1139,7 @@ async def stats_handler(message: Message):
     all_sum = sum(int(r["amount"]) for r in rows)
     pending_receipts = sum(1 for r in rows if not r["receipt_sent"])
 
-    breakdown = "\\n".join(
+    breakdown = "\n".join(
         f"• {html.escape(title)} — {count}"
         for title, count in sorted(product_counts.items())
     ) or "• продаж пока нет"
@@ -1144,7 +1173,7 @@ async def receipt_handler(message: Message):
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2 or not parts[1].strip():
         await message.answer(
-            "Использование:\\n<code>/receipt PAYMENT_ID</code>\\n\\n"
+            "Использование:\n<code>/receipt PAYMENT_ID</code>\n\n"
             "Команда отмечает чек как отправленный и уведомляет покупателя в Telegram.",
             parse_mode=ParseMode.HTML,
         )
@@ -1190,8 +1219,8 @@ async def receipt_handler(message: Message):
         return
 
     await message.answer(
-        f"✅ Чек отмечен как отправленный.\\n"
-        f"Покупатель уведомлён.\\n"
+        f"✅ Чек отмечен как отправленный.\n"
+        f"Покупатель уведомлён.\n"
         f"Payment ID: <code>{html.escape(payment_id)}</code>",
         parse_mode=ParseMode.HTML,
     )
@@ -1272,6 +1301,14 @@ async def notify_success(payment_row):
     name = payment_row["full_name"] or "не указано"
     paid_time = format_moscow_time(payment_row["paid_at"])
 
+    if payment_row["marketing_consent"] == 1:
+        marketing_status = "✅ <b>Рекламная рассылка разрешена</b>"
+    else:
+        marketing_status = (
+            "🚫❗ <b>ВАЖНО: РЕКЛАМНУЮ РАССЫЛКУ ЭТОМУ ПОКУПАТЕЛЮ "
+            "ОТПРАВЛЯТЬ НЕЛЬЗЯ.</b>"
+        )
+
     admin_text = f"""✅ <b>НОВАЯ ОПЛАТА</b>
 
 📚 Продукт: <b>{html.escape(payment_row["product_title"])}</b>
@@ -1287,6 +1324,8 @@ async def notify_success(payment_row):
 
 💳 <b>Payment ID</b>
 <code>{html.escape(payment_row["yookassa_payment_id"])}</code>
+
+{marketing_status}
 
 🧾❗ <b>ВАЖНО: СФОРМИРОВАТЬ ЧЕК В «МОЙ НАЛОГ» И ОБЯЗАТЕЛЬНО ОТПРАВИТЬ ЕГО ПОКУПАТЕЛЮ.</b>\n\nПосле отправки отметьте это командой:\n<code>/receipt {html.escape(payment_row["yookassa_payment_id"])}</code>"""
 
