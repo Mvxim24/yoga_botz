@@ -179,7 +179,7 @@ def legal_text(product_key: str) -> str:
 После оплаты будет предоставлен доступ:
 {access}
 
-ℹ️ Нажимая <b>«Перейти к оплате»</b>, Вы подтверждаете, что ознакомились и принимаете условия <a href="{html.escape(OFFER_URL)}">Публичной оферты</a>, ознакомились с <a href="{html.escape(PRIVACY_URL)}">Политикой конфиденциальности</a> и даёте <a href="{html.escape(CONSENT_URL)}">Согласие на обработку персональных данных</a>.
+ℹ️ Нажимая <b>«Перейти к оплате 💳»</b>, Вы подтверждаете, что ознакомились и принимаете условия <a href="{html.escape(OFFER_URL)}">Публичной оферты</a>, ознакомились с <a href="{html.escape(PRIVACY_URL)}">Политикой конфиденциальности</a> и даёте <a href="{html.escape(CONSENT_URL)}">Согласие на обработку персональных данных</a>.
 
 <a href="{html.escape(MARKETING_URL)}">Согласие на получение рекламных и информационных сообщений</a> является добровольным."""
 
@@ -261,7 +261,7 @@ def details_keyboard(product_key: str) -> InlineKeyboardMarkup:
 def payment_keyboard(url: str, product_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Перейти в ЮKassa 💳", url=url)],
+            [InlineKeyboardButton(text="Перейти к оплате 💳", url=url)],
             [InlineKeyboardButton(text="← Назад", callback_data=f"details:{product_key}")],
         ]
     )
