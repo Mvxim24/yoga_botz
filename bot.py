@@ -20,6 +20,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -1527,6 +1529,34 @@ async def main():
     bot = Bot(BOT_TOKEN)
     me = await bot.get_me()
     BOT_USERNAME = me.username or ""
+
+    # Regular users see only the public start command.
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Открыть меню"),
+        ]
+    )
+
+    # Each admin sees the admin command menu in a private chat with the bot.
+    admin_commands = [
+        BotCommand(command="start", description="Открыть меню"),
+        BotCommand(command="buyers", description="Таблица покупателей"),
+        BotCommand(command="stats", description="Статистика продаж"),
+        BotCommand(command="receipt", description="Отметить чек отправленным"),
+        BotCommand(command="clearpayments", description="Очистить базу покупок"),
+    ]
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.set_my_commands(
+                admin_commands,
+                scope=BotCommandScopeChat(chat_id=admin_id),
+            )
+        except Exception:
+            logger.exception(
+                "Could not set Telegram command menu for admin %s",
+                admin_id,
+            )
 
     dp = Dispatcher()
     dp.include_router(router)
