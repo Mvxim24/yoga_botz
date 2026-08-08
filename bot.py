@@ -165,15 +165,19 @@ TRIAL_TEXT = """🎁 <b>Пробная тренировка</b>
 
 def legal_text(product_key: str) -> str:
     if product_key == "energy":
+        product_title = "ЭНЕРГОКОМПЛЕКС"
         access = "К папке на Яндекс Диск с тренировками"
         period = "Бессрочный"
         price = "999 RUB"
     else:
+        product_title = "ИНДИВИДУАЛЬНЫЕ ЗАНЯТИЯ"
         access = "После оплаты я с Вами свяжусь для уточнения графика тренировок."
         period = "8 занятий в месяц"
         price = "15 000 RUB"
 
-    return f"""— Период: <b>{period}</b>
+    return f"""📚 Продукт: <b>«{product_title}»</b>
+
+— Период: <b>{period}</b>
 — Сумма к оплате: <b>{price}</b>
 
 После оплаты будет предоставлен доступ:
@@ -218,7 +222,7 @@ def products_keyboard() -> InlineKeyboardMarkup:
 def product_keyboard(product_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить", callback_data=f"card:{product_key}")],
+            [InlineKeyboardButton(text="💳 Оплатить", callback_data=f"details:{product_key}")],
             [InlineKeyboardButton(text="← Назад", callback_data="menu")],
         ]
     )
@@ -250,8 +254,8 @@ def details_keyboard(product_key: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="🏠 В меню",
-                    callback_data="menu",
+                    text="← Назад",
+                    callback_data=f"product:{product_key}",
                 )
             ],
         ]
@@ -262,7 +266,7 @@ def payment_keyboard(url: str, product_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Перейти к оплате 💳", url=url)],
-            [InlineKeyboardButton(text="← Назад", callback_data=f"details:{product_key}")],
+            [InlineKeyboardButton(text="← Назад", callback_data=f"product:{product_key}")],
         ]
     )
 
@@ -837,8 +841,7 @@ async def card_handler(query: CallbackQuery, state: FSMContext):
     if key not in PRODUCTS:
         await query.answer("Неизвестный продукт", show_alert=True)
         return
-    text = ENERGY_CARD_TEXT if key == "energy" else INDIVIDUAL_CARD_TEXT
-    await safe_edit(query, text, card_keyboard(key))
+    await safe_edit(query, legal_text(key), details_keyboard(key))
     await query.answer()
 
 
@@ -871,7 +874,7 @@ async def begin_email_checkout(query: CallbackQuery, state: FSMContext, key: str
         text,
         InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="← Назад", callback_data=f"details:{key}")]
+                [InlineKeyboardButton(text="← Назад", callback_data=f"product:{key}")]
             ]
         ),
     )
