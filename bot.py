@@ -166,9 +166,7 @@ ABOUT_TEXT = """Привет! 👋
 
 SUPPORT_TEXT = """Если возникли вопросы — напишите мне напрямую: @veranikkiri"""
 
-TRIAL_TEXT = """🎁 <b>Пробная тренировка</b>
-
-Можете написать мне @veranikkiri, и я пришлю ссылку на пробную практику!"""
+TRIAL_TEXT = """🎁 <b>Пробная тренировка 🎁</b>\n\nПрактика ждет тебя здесь 🎁https://t.me/yogaloversclub/603""""
 
 
 def legal_text(product_key: str) -> str:
