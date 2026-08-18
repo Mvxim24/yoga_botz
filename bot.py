@@ -1247,6 +1247,16 @@ async def refund_confirm_handler(callback: CallbackQuery):
         f"{delete_note}",
         parse_mode=ParseMode.HTML,
     )
+
+    await callback.message.answer(
+        "✅ <b>Команда /refund выполнена</b>\n\n"
+        f"📚 Продукт: {html.escape(payment_row['product_title'])}\n"
+        f"👤 Покупатель: {html.escape(payment_row['full_name'] or 'не указано')}\n"
+        f"💳 Payment ID: <code>{html.escape(payment_id)}</code>\n\n"
+        "↩️ Возврат отмечен в базе данных.",
+        parse_mode=ParseMode.HTML,
+    )
+
     await callback.answer("Возврат отмечен")
 
 
