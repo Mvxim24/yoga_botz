@@ -323,8 +323,19 @@ CREATE TABLE IF NOT EXISTS payments (
     receipt_sent INTEGER NOT NULL DEFAULT 0,
     receipt_sent_at TEXT,
     marketing_consent INTEGER,
-    marketing_consent_at TEXT
+    marketing_consent_at TEXT,
+    refunded INTEGER NOT NULL DEFAULT 0,
+    refunded_at TEXT,
+    refund_admin_id BIGINT,
+    access_message_id BIGINT,
+    access_revoked_at TEXT
 );
+
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS refunded INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS refunded_at TEXT;
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_admin_id BIGINT;
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS access_message_id BIGINT;
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS access_revoked_at TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_payments_tg ON payments(telegram_id);
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
@@ -407,15 +418,33 @@ async def mark_notification_sent(payment_id: str):
         "UPDATE payments SET notification_sent=1 WHERE yookassa_payment_id=$1", payment_id
     )
 
-async def mark_access_sent(payment_id: str):
+async def mark_access_sent(payment_id: str, message_id: int):
     await db_pool.execute(
-        "UPDATE payments SET access_sent=1 WHERE yookassa_payment_id=$1", payment_id
+        """UPDATE payments
+        SET access_sent=1, access_message_id=$1
+        WHERE yookassa_payment_id=$2""",
+        message_id, payment_id,
     )
+
+async def mark_refunded(payment_id: str, admin_id: int, access_revoked: bool) -> bool:
+    now = utcnow_iso()
+    result = await db_pool.execute(
+        """UPDATE payments
+        SET refunded=1,
+            refunded_at=$1,
+            refund_admin_id=$2,
+            access_revoked_at=$3
+        WHERE yookassa_payment_id=$4
+          AND status='succeeded'
+          AND refunded=0""",
+        now, admin_id, now if access_revoked else None, payment_id,
+    )
+    return result == "UPDATE 1"
 
 async def paid_buyers_rows():
     return await db_pool.fetch(
         """SELECT paid_at, telegram_id, full_name, username, email, product_title, amount, currency,
-        yookassa_payment_id, marketing_consent, marketing_consent_at
+        yookassa_payment_id, marketing_consent, marketing_consent_at, refunded, refunded_at
         FROM payments WHERE status='succeeded' ORDER BY paid_at DESC"""
     )
 
@@ -423,7 +452,8 @@ async def user_paid_purchases(telegram_id: int, limit: int = 10):
     return await db_pool.fetch(
         """SELECT paid_at, telegram_id, email, product_key, product_title, amount, currency,
         yookassa_payment_id, receipt_sent FROM payments
-        WHERE telegram_id=$1 AND status='succeeded' ORDER BY paid_at DESC LIMIT $2""",
+        WHERE telegram_id=$1 AND status='succeeded' AND refunded=0
+        ORDER BY paid_at DESC LIMIT $2""",
         telegram_id, limit,
     )
 
@@ -927,6 +957,8 @@ async def buyers_handler(message: Message):
                 "YooKassa payment ID",
                 "Рекламная рассылка разрешена",
                 "Дата согласия/отказа UTC",
+                "Возврат",
+                "Дата возврата UTC",
             ]
         )
         for row in rows:
@@ -943,6 +975,8 @@ async def buyers_handler(message: Message):
                     row["yookassa_payment_id"],
                     "ДА" if row["marketing_consent"] == 1 else "НЕТ",
                     row["marketing_consent_at"] or "",
+                    "ДА" if row["refunded"] == 1 else "НЕТ",
+                    row["refunded_at"] or "",
                 ]
             )
 
@@ -1076,6 +1110,155 @@ async def receipt_handler(message: Message):
         f"Payment ID: <code>{html.escape(payment_id)}</code>",
         parse_mode=ParseMode.HTML,
     )
+
+
+@router.message(Command("refund"))
+async def refund_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        await message.answer(
+            "Использование:\n<code>/refund PAYMENT_ID</code>\n\n"
+            "Команда отмечает возврат в базе и удаляет сохранённое ботом сообщение с доступом после подтверждения.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    payment_id = parts[1].strip()
+    payment_row = await get_payment(payment_id)
+
+    if not payment_row or payment_row["status"] != "succeeded":
+        await message.answer("Успешный платёж с таким Payment ID не найден.")
+        return
+
+    if payment_row["refunded"]:
+        refunded_at = payment_row["refunded_at"] or "дата не указана"
+        await message.answer(
+            "↩️ Этот платёж уже отмечен как возвращённый.\n"
+            f"Payment ID: <code>{html.escape(payment_id)}</code>\n"
+            f"Дата возврата: {html.escape(refunded_at)}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    username = f"@{payment_row['username']}" if payment_row["username"] else "нет"
+    full_name = payment_row["full_name"] or "не указано"
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить возврат",
+                    callback_data=f"refund_confirm:{payment_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data=f"refund_cancel:{payment_id}",
+                )
+            ],
+        ]
+    )
+
+    await message.answer(
+        f"⚠️ <b>Подтвердите возврат</b>\n\n"
+        f"📚 Продукт: <b>{html.escape(payment_row['product_title'])}</b>\n"
+        f"💰 Сумма: <b>{payment_row['amount']} {html.escape(payment_row['currency'])}</b>\n"
+        f"👤 Покупатель: {html.escape(full_name)}\n"
+        f"🔗 Username: {html.escape(username)}\n"
+        f"🆔 Telegram ID: <code>{payment_row['telegram_id']}</code>\n"
+        f"📧 Email: <code>{html.escape(payment_row['email'])}</code>\n\n"
+        f"💳 Payment ID:\n<code>{html.escape(payment_id)}</code>\n\n"
+        "После подтверждения покупка будет отмечена как возвращённая, "
+        "исчезнет из раздела «Мои покупки», а сохранённое ботом сообщение с доступом будет удалено, если его ID есть в базе.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("refund_confirm:"))
+async def refund_confirm_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+
+    payment_id = callback.data.split(":", 1)[1]
+    payment_row = await get_payment(payment_id)
+
+    if not payment_row or payment_row["status"] != "succeeded":
+        await callback.message.edit_text("❌ Успешный платёж с таким Payment ID не найден.")
+        await callback.answer()
+        return
+
+    if payment_row["refunded"]:
+        await callback.message.edit_text(
+            "↩️ Этот платёж уже был отмечен как возвращённый.\n"
+            f"Payment ID: <code>{html.escape(payment_id)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        await callback.answer()
+        return
+
+    access_deleted = False
+    delete_note = ""
+    access_message_id = payment_row["access_message_id"]
+
+    if access_message_id:
+        try:
+            await bot.delete_message(
+                chat_id=payment_row["telegram_id"],
+                message_id=access_message_id,
+            )
+            access_deleted = True
+            delete_note = "✅ Сообщение с доступом удалено из чата покупателя."
+        except Exception:
+            logger.exception(
+                "Could not delete access message for refunded payment %s",
+                payment_id,
+            )
+            delete_note = "⚠️ Возврат отмечен, но сообщение с доступом удалить не удалось."
+    else:
+        delete_note = (
+            "⚠️ У этой старой покупки нет сохранённого ID сообщения, поэтому старое сообщение "
+            "автоматически удалить невозможно. Из «Моих покупок» покупка всё равно будет скрыта."
+        )
+
+    updated = await mark_refunded(
+        payment_id,
+        callback.from_user.id,
+        access_deleted,
+    )
+
+    if not updated:
+        await callback.message.edit_text(
+            "❌ Не удалось отметить возврат. Возможно, запись уже была изменена."
+        )
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        "↩️ <b>Возврат отмечен</b>\n\n"
+        f"📚 {html.escape(payment_row['product_title'])}\n"
+        f"👤 {html.escape(payment_row['full_name'] or 'не указано')}\n"
+        f"💳 Payment ID: <code>{html.escape(payment_id)}</code>\n\n"
+        f"{delete_note}",
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer("Возврат отмечен")
+
+
+@router.callback_query(F.data.startswith("refund_cancel:"))
+async def refund_cancel_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+
+
+    await callback.message.edit_text("❌ Возврат отменён. Никаких изменений не внесено.")
+    await callback.answer("Отменено")
 @router.message(Command("clearpayments"))
 async def clear_payments_command(message: Message):
     if not is_admin(message.from_user.id):
@@ -1237,14 +1420,17 @@ async def send_customer_success(payment_row):
 Если возникнут вопросы, укажите Payment ID — так я смогу быстрее найти Ваш платёж."""
 
     try:
-        await bot.send_message(
+        sent_message = await bot.send_message(
             tg_id,
             text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=after_purchase_keyboard(product_key),
         )
-        await mark_access_sent(payment_row["yookassa_payment_id"])
+        await mark_access_sent(
+            payment_row["yookassa_payment_id"],
+            sent_message.message_id,
+        )
     except Exception:
         logger.exception(
             "Could not send customer success for payment %s",
@@ -1341,11 +1527,11 @@ async def yookassa_webhook(request: web.Request):
     payment_row = await get_payment(payment_id)
 
     # Idempotent business actions. YooKassa can resend notifications.
-    if payment_row and not payment_row["notification_sent"]:
+    if payment_row and not payment_row["refunded"] and not payment_row["notification_sent"]:
         await notify_success(payment_row)
         payment_row = await get_payment(payment_id)
 
-    if payment_row and not payment_row["access_sent"]:
+    if payment_row and not payment_row["refunded"] and not payment_row["access_sent"]:
         await send_customer_success(payment_row)
 
     return web.Response(status=200, text="ok")
@@ -1389,6 +1575,7 @@ async def main():
         BotCommand(command="buyers", description="Таблица покупателей"),
         BotCommand(command="stats", description="Статистика продаж"),
         BotCommand(command="receipt", description="Отметить чек отправленным"),
+        BotCommand(command="refund", description="Отметить возврат"),
         BotCommand(command="clearpayments", description="Очистить базу покупок"),
     ]
 
