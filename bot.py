@@ -434,14 +434,6 @@ async def mark_notification_sent(payment_id: str):
         "UPDATE payments SET notification_sent=1 WHERE yookassa_payment_id=$1", payment_id
     )
 
-async def mark_access_sent(payment_id: str, message_id: int):
-    await db_pool.execute(
-        """UPDATE payments
-        SET access_sent=1, access_message_id=$1
-        WHERE yookassa_payment_id=$2""",
-        message_id, payment_id,
-    )
-
 async def mark_refunded(payment_id: str, admin_id: int, access_revoked: bool) -> bool:
     now = utcnow_iso()
     result = await db_pool.execute(
