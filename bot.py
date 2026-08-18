@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiohttp
-import aiosqlite
+import asyncpg
 from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
@@ -60,8 +60,7 @@ MARKETING_URL = os.getenv("MARKETING_URL", "https://example.com/marketing").stri
 
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", 8080))
-DATA_DIR = os.getenv("DATA_DIR", ".").strip() or "."
-DB_PATH = os.getenv("DB_PATH", str(Path(DATA_DIR) / "yoga_bot.sqlite3"))
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 # If your hosting passes the real client IP via X-Forwarded-For, set true.
 # We still verify the payment directly via YooKassa API, so IP filtering is
@@ -114,6 +113,8 @@ if not PUBLIC_BASE_URL.startswith("https://"):
     raise RuntimeError("PUBLIC_BASE_URL must be a public HTTPS URL")
 if not WEBHOOK_SECRET or len(WEBHOOK_SECRET) < 24:
     raise RuntimeError("WEBHOOK_SECRET must be a long random value (24+ chars)")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is missing in .env")
 
 
 # ============================================================
@@ -288,26 +289,25 @@ def after_purchase_keyboard(product_key: str) -> InlineKeyboardMarkup:
 
 
 # ============================================================
-# DATABASE
+# DATABASE (PostgreSQL)
 # ============================================================
 
 CREATE_SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-
 CREATE TABLE IF NOT EXISTS users (
-    telegram_id INTEGER PRIMARY KEY,
+    telegram_id BIGINT PRIMARY KEY,
     username TEXT,
     full_name TEXT,
-    service_message_id INTEGER,
+    service_message_id BIGINT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    marketing_consent INTEGER,
+    marketing_consent_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS payments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id BIGSERIAL PRIMARY KEY,
     yookassa_payment_id TEXT UNIQUE,
-    telegram_id INTEGER NOT NULL,
+    telegram_id BIGINT NOT NULL,
     username TEXT,
     full_name TEXT,
     email TEXT NOT NULL,
@@ -330,282 +330,122 @@ CREATE INDEX IF NOT EXISTS idx_payments_tg ON payments(telegram_id);
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
 """
 
+db_pool: Optional[asyncpg.Pool] = None
+
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-
 async def init_db():
-    db_parent = Path(DB_PATH).parent
-    db_parent.mkdir(parents=True, exist_ok=True)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript(CREATE_SCHEMA)
-
-        # Lightweight migration for databases created by older bot versions.
-        cur = await db.execute("PRAGMA table_info(users)")
-        existing_user_columns = {row[1] for row in await cur.fetchall()}
-        if "service_message_id" not in existing_user_columns:
-            await db.execute(
-                "ALTER TABLE users ADD COLUMN service_message_id INTEGER"
-            )
-
-        if "marketing_consent" not in existing_user_columns:
-            await db.execute(
-                "ALTER TABLE users ADD COLUMN marketing_consent INTEGER"
-            )
-
-        if "marketing_consent_at" not in existing_user_columns:
-            await db.execute(
-                "ALTER TABLE users ADD COLUMN marketing_consent_at TEXT"
-            )
-
-        cur = await db.execute("PRAGMA table_info(payments)")
-        existing_columns = {row[1] for row in await cur.fetchall()}
-
-        if "receipt_sent" not in existing_columns:
-            await db.execute(
-                "ALTER TABLE payments ADD COLUMN receipt_sent INTEGER NOT NULL DEFAULT 0"
-            )
-        if "receipt_sent_at" not in existing_columns:
-            await db.execute(
-                "ALTER TABLE payments ADD COLUMN receipt_sent_at TEXT"
-            )
-        if "marketing_consent" not in existing_columns:
-            await db.execute(
-                "ALTER TABLE payments ADD COLUMN marketing_consent INTEGER"
-            )
-        if "marketing_consent_at" not in existing_columns:
-            await db.execute(
-                "ALTER TABLE payments ADD COLUMN marketing_consent_at TEXT"
-            )
-
-        await db.commit()
-
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with db_pool.acquire() as conn:
+        await conn.execute(CREATE_SCHEMA)
 
 async def upsert_user(message_or_query_user):
     user = message_or_query_user
     now = utcnow_iso()
     full_name = " ".join(x for x in [user.first_name, user.last_name] if x).strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO users(telegram_id, username, full_name, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(telegram_id) DO UPDATE SET
-              username=excluded.username,
-              full_name=excluded.full_name,
-              updated_at=excluded.updated_at
-            """,
-            (user.id, user.username, full_name, now, now),
-        )
-        await db.commit()
-
+    await db_pool.execute(
+        """INSERT INTO users(telegram_id, username, full_name, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+          username=EXCLUDED.username, full_name=EXCLUDED.full_name, updated_at=EXCLUDED.updated_at""",
+        user.id, user.username, full_name, now, now,
+    )
 
 async def get_service_message_id(telegram_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT service_message_id FROM users WHERE telegram_id=?",
-            (telegram_id,),
-        )
-        row = await cur.fetchone()
-        return row[0] if row and row[0] else None
-
+    return await db_pool.fetchval(
+        "SELECT service_message_id FROM users WHERE telegram_id=$1", telegram_id
+    )
 
 async def set_service_message_id(telegram_id: int, message_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET service_message_id=?, updated_at=? WHERE telegram_id=?",
-            (message_id, utcnow_iso(), telegram_id),
-        )
-        await db.commit()
-
+    await db_pool.execute(
+        "UPDATE users SET service_message_id=$1, updated_at=$2 WHERE telegram_id=$3",
+        message_id, utcnow_iso(), telegram_id,
+    )
 
 async def set_marketing_consent(telegram_id: int, consent: bool):
     now = utcnow_iso()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            UPDATE users
-            SET marketing_consent=?,
-                marketing_consent_at=?,
-                updated_at=?
-            WHERE telegram_id=?
-            """,
-            (
-                1 if consent else 0,
-                now,
-                now,
-                telegram_id,
-            ),
-        )
-        await db.commit()
+    await db_pool.execute(
+        """UPDATE users SET marketing_consent=$1, marketing_consent_at=$2, updated_at=$3
+        WHERE telegram_id=$4""",
+        1 if consent else 0, now, now, telegram_id,
+    )
 
-
-async def insert_pending_payment(
-    payment_id: str,
-    telegram_id: int,
-    username: Optional[str],
-    full_name: str,
-    email: str,
-    product_key: str,
-):
+async def insert_pending_payment(payment_id: str, telegram_id: int, username: Optional[str], full_name: str, email: str, product_key: str):
     product = PRODUCTS[product_key]
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            SELECT marketing_consent, marketing_consent_at
-            FROM users
-            WHERE telegram_id=?
-            """,
-            (telegram_id,),
-        )
-        consent_row = await cur.fetchone()
-        marketing_consent = consent_row[0] if consent_row else None
-        marketing_consent_at = consent_row[1] if consent_row else None
-
-        await db.execute(
-            """
-            INSERT OR IGNORE INTO payments(
-                yookassa_payment_id, telegram_id, username, full_name, email,
-                product_key, product_title, amount, currency, status, created_at,
-                marketing_consent, marketing_consent_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RUB', 'pending', ?, ?, ?)
-            """,
-            (
-                payment_id,
-                telegram_id,
-                username,
-                full_name,
-                email,
-                product_key,
-                product["title"],
-                product["price"],
-                utcnow_iso(),
-                marketing_consent,
-                marketing_consent_at,
-            ),
-        )
-        await db.commit()
-
+    consent_row = await db_pool.fetchrow(
+        "SELECT marketing_consent, marketing_consent_at FROM users WHERE telegram_id=$1", telegram_id
+    )
+    marketing_consent = consent_row["marketing_consent"] if consent_row else None
+    marketing_consent_at = consent_row["marketing_consent_at"] if consent_row else None
+    await db_pool.execute(
+        """INSERT INTO payments(
+            yookassa_payment_id, telegram_id, username, full_name, email, product_key,
+            product_title, amount, currency, status, created_at, marketing_consent, marketing_consent_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'RUB','pending',$9,$10,$11)
+        ON CONFLICT (yookassa_payment_id) DO NOTHING""",
+        payment_id, telegram_id, username, full_name, email, product_key, product["title"],
+        product["price"], utcnow_iso(), marketing_consent, marketing_consent_at,
+    )
 
 async def get_payment(payment_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM payments WHERE yookassa_payment_id = ?",
-            (payment_id,),
-        )
-        return await cur.fetchone()
-
+    return await db_pool.fetchrow(
+        "SELECT * FROM payments WHERE yookassa_payment_id=$1", payment_id
+    )
 
 async def mark_paid(payment_id: str) -> bool:
-    """Returns True only for the first successful transition to paid."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            UPDATE payments
-            SET status='succeeded', paid_at=?
-            WHERE yookassa_payment_id=? AND status!='succeeded'
-            """,
-            (utcnow_iso(), payment_id),
-        )
-        await db.commit()
-        return cur.rowcount > 0
-
+    result = await db_pool.execute(
+        """UPDATE payments SET status='succeeded', paid_at=$1
+        WHERE yookassa_payment_id=$2 AND status!='succeeded'""",
+        utcnow_iso(), payment_id,
+    )
+    return result == "UPDATE 1"
 
 async def mark_notification_sent(payment_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE payments SET notification_sent=1 WHERE yookassa_payment_id=?",
-            (payment_id,),
-        )
-        await db.commit()
-
+    await db_pool.execute(
+        "UPDATE payments SET notification_sent=1 WHERE yookassa_payment_id=$1", payment_id
+    )
 
 async def mark_access_sent(payment_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE payments SET access_sent=1 WHERE yookassa_payment_id=?",
-            (payment_id,),
-        )
-        await db.commit()
-
+    await db_pool.execute(
+        "UPDATE payments SET access_sent=1 WHERE yookassa_payment_id=$1", payment_id
+    )
 
 async def paid_buyers_rows():
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            """
-            SELECT paid_at, telegram_id, full_name, username, email,
-                   product_title, amount, currency, yookassa_payment_id,
-                   marketing_consent, marketing_consent_at
-            FROM payments
-            WHERE status='succeeded'
-            ORDER BY paid_at DESC
-            """
-        )
-        return await cur.fetchall()
-
+    return await db_pool.fetch(
+        """SELECT paid_at, telegram_id, full_name, username, email, product_title, amount, currency,
+        yookassa_payment_id, marketing_consent, marketing_consent_at
+        FROM payments WHERE status='succeeded' ORDER BY paid_at DESC"""
+    )
 
 async def user_paid_purchases(telegram_id: int, limit: int = 10):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            """
-            SELECT paid_at, telegram_id, email, product_key, product_title,
-                   amount, currency, yookassa_payment_id, receipt_sent
-            FROM payments
-            WHERE telegram_id=? AND status='succeeded'
-            ORDER BY paid_at DESC
-            LIMIT ?
-            """,
-            (telegram_id, limit),
-        )
-        return await cur.fetchall()
-
+    return await db_pool.fetch(
+        """SELECT paid_at, telegram_id, email, product_key, product_title, amount, currency,
+        yookassa_payment_id, receipt_sent FROM payments
+        WHERE telegram_id=$1 AND status='succeeded' ORDER BY paid_at DESC LIMIT $2""",
+        telegram_id, limit,
+    )
 
 async def successful_payments_full():
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            """
-            SELECT paid_at, product_key, product_title, amount, currency,
-                   yookassa_payment_id, receipt_sent
-            FROM payments
-            WHERE status='succeeded'
-            ORDER BY paid_at DESC
-            """
-        )
-        return await cur.fetchall()
-
+    return await db_pool.fetch(
+        """SELECT paid_at, product_key, product_title, amount, currency, yookassa_payment_id, receipt_sent
+        FROM payments WHERE status='succeeded' ORDER BY paid_at DESC"""
+    )
 
 async def mark_receipt_sent(payment_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            UPDATE payments
-            SET receipt_sent=1, receipt_sent_at=?
-            WHERE yookassa_payment_id=? AND status='succeeded'
-            """,
-            (utcnow_iso(), payment_id),
-        )
-        await db.commit()
-        return cur.rowcount > 0
+    result = await db_pool.execute(
+        """UPDATE payments SET receipt_sent=1, receipt_sent_at=$1
+        WHERE yookassa_payment_id=$2 AND status='succeeded'""",
+        utcnow_iso(), payment_id,
+    )
+    return result == "UPDATE 1"
+
 async def clear_payments():
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Узнаём, сколько записей было удалено
-        cur = await db.execute("SELECT COUNT(*) FROM payments")
-        deleted_count = (await cur.fetchone())[0]
+    deleted_count = await db_pool.fetchval("SELECT COUNT(*) FROM payments")
+    await db_pool.execute("TRUNCATE TABLE payments RESTART IDENTITY")
+    return deleted_count
 
-        # Очищаем таблицу
-        await db.execute("DELETE FROM payments")
-
-        # Сбрасываем счётчик AUTOINCREMENT
-        await db.execute("DELETE FROM sqlite_sequence WHERE name='payments'")
-
-        await db.commit()
-
-        return deleted_count
 
 # ============================================================
 # RATE LIMIT
@@ -1580,6 +1420,8 @@ async def main():
     finally:
         await runner.cleanup()
         await bot.session.close()
+        if db_pool:
+            await db_pool.close()
 
 
 if __name__ == "__main__":
