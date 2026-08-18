@@ -981,8 +981,19 @@ async def buyers_handler(message: Message):
                 ]
             )
 
-    total = sum(int(row["amount"]) for row in rows)
-    caption = f"Покупателей/оплат: {len(rows)}\nСумма успешных оплат: {total:,} ₽".replace(",", " ")
+    gross_total = sum(int(row["amount"]) for row in rows)
+    refunded_rows = [row for row in rows if row["refunded"] == 1]
+    refunded_total = sum(int(row["amount"]) for row in refunded_rows)
+    net_total = gross_total - refunded_total
+
+    caption = (
+        f"Покупателей/оплат: {len(rows)}\n"
+        f"Сумма успешных оплат: {gross_total:,} ₽\n"
+        f"Возвратов: {len(refunded_rows)}\n"
+        f"Возвращено: {refunded_total:,} ₽\n"
+        f"Фактическая выручка: {net_total:,} ₽"
+    ).replace(",", " ")
+
     await message.answer_document(FSInputFile(filepath), caption=caption)
 
     with suppress(Exception):
