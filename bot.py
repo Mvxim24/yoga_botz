@@ -459,7 +459,8 @@ async def user_paid_purchases(telegram_id: int, limit: int = 10):
 
 async def successful_payments_full():
     return await db_pool.fetch(
-        """SELECT paid_at, product_key, product_title, amount, currency, yookassa_payment_id, receipt_sent
+        """SELECT paid_at, product_key, product_title, amount, currency,
+        yookassa_payment_id, receipt_sent, refunded, refunded_at
         FROM payments WHERE status='succeeded' ORDER BY paid_at DESC"""
     )
 
@@ -997,11 +998,16 @@ async def stats_handler(message: Message):
     now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
     rows = await successful_payments_full()
 
+    active_rows = [row for row in rows if not row["refunded"]]
+    refunded_rows = [row for row in rows if row["refunded"]]
+
     today_rows = []
     month_rows = []
+    today_refunded_rows = []
+    month_refunded_rows = []
     product_counts = {}
 
-    for row in rows:
+    for row in active_rows:
         if not row["paid_at"]:
             continue
         try:
@@ -1020,10 +1026,32 @@ async def stats_handler(message: Message):
                 product_counts.get(row["product_title"], 0) + 1
             )
 
+    for row in refunded_rows:
+        refunded_at = row["refunded_at"]
+        if not refunded_at:
+            continue
+        try:
+            refunded_dt = datetime.fromisoformat(refunded_at).astimezone(
+                ZoneInfo("Europe/Moscow")
+            )
+        except Exception:
+            continue
+
+        if refunded_dt.date() == now_msk.date():
+            today_refunded_rows.append(row)
+
+        if refunded_dt.year == now_msk.year and refunded_dt.month == now_msk.month:
+            month_refunded_rows.append(row)
+
     today_sum = sum(int(r["amount"]) for r in today_rows)
     month_sum = sum(int(r["amount"]) for r in month_rows)
-    all_sum = sum(int(r["amount"]) for r in rows)
-    pending_receipts = sum(1 for r in rows if not r["receipt_sent"])
+    all_sum = sum(int(r["amount"]) for r in active_rows)
+
+    today_refunded_sum = sum(int(r["amount"]) for r in today_refunded_rows)
+    month_refunded_sum = sum(int(r["amount"]) for r in month_refunded_rows)
+    all_refunded_sum = sum(int(r["amount"]) for r in refunded_rows)
+
+    pending_receipts = sum(1 for r in active_rows if not r["receipt_sent"])
 
     breakdown = "\n".join(
         f"• {html.escape(title)} — {count}"
@@ -1035,16 +1063,22 @@ async def stats_handler(message: Message):
 <b>Сегодня</b>
 Продаж: {len(today_rows)}
 Сумма: {today_sum:,} ₽
+Возвратов: {len(today_refunded_rows)}
+Возвращено: {today_refunded_sum:,} ₽
 
 <b>Текущий месяц</b>
 Продаж: {len(month_rows)}
 Сумма: {month_sum:,} ₽
+Возвратов: {len(month_refunded_rows)}
+Возвращено: {month_refunded_sum:,} ₽
 
 {breakdown}
 
 <b>За всё время</b>
-Продаж: {len(rows)}
-Сумма: {all_sum:,} ₽
+Продаж без возвратов: {len(active_rows)}
+Выручка без возвратов: {all_sum:,} ₽
+Возвратов: {len(refunded_rows)}
+Возвращено: {all_refunded_sum:,} ₽
 
 🧾 Чеков ожидают отметки об отправке: {pending_receipts}""".replace(",", " ")
 
