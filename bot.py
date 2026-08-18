@@ -327,15 +327,23 @@ CREATE TABLE IF NOT EXISTS payments (
     refunded INTEGER NOT NULL DEFAULT 0,
     refunded_at TEXT,
     refund_admin_id BIGINT,
+    checkout_message_id BIGINT,
     access_message_id BIGINT,
+    access_status TEXT NOT NULL DEFAULT 'pending',
     access_revoked_at TEXT
 );
 
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS refunded INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS refunded_at TEXT;
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_admin_id BIGINT;
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS checkout_message_id BIGINT;
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS access_message_id BIGINT;
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS access_status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS access_revoked_at TEXT;
+
+UPDATE payments
+SET access_status='sent'
+WHERE access_sent=1 AND access_status!='sent';
 
 CREATE INDEX IF NOT EXISTS idx_payments_tg ON payments(telegram_id);
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
@@ -403,6 +411,14 @@ async def insert_pending_payment(payment_id: str, telegram_id: int, username: Op
 async def get_payment(payment_id: str):
     return await db_pool.fetchrow(
         "SELECT * FROM payments WHERE yookassa_payment_id=$1", payment_id
+    )
+
+async def set_checkout_message_id(payment_id: str, message_id: int):
+    await db_pool.execute(
+        """UPDATE payments
+        SET checkout_message_id=$1
+        WHERE yookassa_payment_id=$2""",
+        message_id, payment_id,
     )
 
 async def mark_paid(payment_id: str) -> bool:
@@ -820,7 +836,7 @@ async def receive_email(message: Message, state: FSMContext):
     ).strip()
 
     try:
-        _, payment_url = await create_yookassa_payment(
+        payment_id, payment_url = await create_yookassa_payment(
             telegram_id=message.from_user.id,
             full_name=full_name,
             username=message.from_user.username,
@@ -853,13 +869,14 @@ async def receive_email(message: Message, state: FSMContext):
             message_id=menu_message_id,
         )
 
-    await bot.send_message(
+    payment_message = await bot.send_message(
         chat_id=menu_chat_id,
         text=text,
         reply_markup=payment_keyboard(payment_url, key),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+    await set_checkout_message_id(payment_id, payment_message.message_id)
 
     await state.clear()
 
@@ -1431,17 +1448,51 @@ async def notify_success(payment_row):
     await mark_notification_sent(payment_row["yookassa_payment_id"])
 
 
-async def send_customer_success(payment_row):
-    tg_id = payment_row["telegram_id"]
-    product_key = payment_row["product_key"]
-    payment_id = html.escape(payment_row["yookassa_payment_id"])
+async def send_customer_success(payment_id: str):
+    """
+    Deliver access exactly once per payment as far as PostgreSQL + Telegram allow.
 
-    if product_key == "energy":
-        if YANDEX_DISK_URL:
-            text = f"""✅ <b>Платёж принят!</b>
+    A PostgreSQL row lock serializes concurrent YooKassa webhook deliveries.
+    The already-known checkout message is edited in place. If the process dies
+    after Telegram accepted the edit but before the DB transaction commits, a
+    retry edits the same message again instead of creating a duplicate.
+    """
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            payment_row = await conn.fetchrow(
+                """SELECT *
+                FROM payments
+                WHERE yookassa_payment_id=$1
+                FOR UPDATE""",
+                payment_id,
+            )
+
+            if not payment_row:
+                return False
+            if payment_row["status"] != "succeeded":
+                return False
+            if payment_row["refunded"]:
+                return False
+            if payment_row["access_sent"] or payment_row["access_status"] == "sent":
+                return True
+
+            await conn.execute(
+                """UPDATE payments
+                SET access_status='processing'
+                WHERE yookassa_payment_id=$1""",
+                payment_id,
+            )
+
+            tg_id = payment_row["telegram_id"]
+            product_key = payment_row["product_key"]
+            escaped_payment_id = html.escape(payment_row["yookassa_payment_id"])
+
+            if product_key == "energy":
+                if YANDEX_DISK_URL:
+                    success_text = f"""✅ <b>Платёж принят!</b>
 
 🆔 <b>Payment ID:</b>
-<code>{payment_id}</code>
+<code>{escaped_payment_id}</code>
 
 Спасибо за покупку энергокомплекса!
 
@@ -1451,22 +1502,22 @@ async def send_customer_success(payment_row):
 {html.escape(YANDEX_DISK_URL)}
 
 Если возникнут вопросы, укажите Payment ID — так я смогу быстрее найти Ваш платёж."""
-        else:
-            text = f"""✅ <b>Платёж принят!</b>
+                else:
+                    success_text = f"""✅ <b>Платёж принят!</b>
 
 🆔 <b>Payment ID:</b>
-<code>{payment_id}</code>
+<code>{escaped_payment_id}</code>
 
 Спасибо за покупку энергокомплекса!
 
 📧 Чек будет отправлен Вам на указанную электронную почту в ближайшее время.
 
 Ссылка на материалы временно не настроена. Напишите @veranikkiri, и я отправлю доступ вручную."""
-    else:
-        text = f"""✅ <b>Платёж принят!</b>
+            else:
+                success_text = f"""✅ <b>Платёж принят!</b>
 
 🆔 <b>Payment ID:</b>
-<code>{payment_id}</code>
+<code>{escaped_payment_id}</code>
 
 📧 Чек будет отправлен Вам на указанную электронную почту в ближайшее время.
 
@@ -1474,23 +1525,66 @@ async def send_customer_success(payment_row):
 
 Если возникнут вопросы, укажите Payment ID — так я смогу быстрее найти Ваш платёж."""
 
-    try:
-        sent_message = await bot.send_message(
-            tg_id,
-            text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=after_purchase_keyboard(product_key),
-        )
-        await mark_access_sent(
-            payment_row["yookassa_payment_id"],
-            sent_message.message_id,
-        )
-    except Exception:
-        logger.exception(
-            "Could not send customer success for payment %s",
-            payment_row["yookassa_payment_id"],
-        )
+            delivered_message_id = None
+            checkout_message_id = payment_row["checkout_message_id"]
+
+            if checkout_message_id:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=tg_id,
+                        message_id=checkout_message_id,
+                        text=success_text,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                        reply_markup=after_purchase_keyboard(product_key),
+                    )
+                    delivered_message_id = checkout_message_id
+                except Exception as exc:
+                    error_text = str(exc).lower()
+
+                    # A retry after a crash can reach an already-edited message.
+                    # That is success, not a reason to send a duplicate.
+                    if "message is not modified" in error_text:
+                        delivered_message_id = checkout_message_id
+                    # Only fall back to a new message when Telegram explicitly
+                    # says the old checkout message cannot be used anymore.
+                    elif (
+                        "message to edit not found" in error_text
+                        or "message can't be edited" in error_text
+                        or "message can\\'t be edited" in error_text
+                    ):
+                        sent_message = await bot.send_message(
+                            tg_id,
+                            success_text,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                            reply_markup=after_purchase_keyboard(product_key),
+                        )
+                        delivered_message_id = sent_message.message_id
+                    else:
+                        raise
+            else:
+                # Compatibility path for purchases created before this update.
+                sent_message = await bot.send_message(
+                    tg_id,
+                    success_text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=after_purchase_keyboard(product_key),
+                )
+                delivered_message_id = sent_message.message_id
+
+            await conn.execute(
+                """UPDATE payments
+                SET access_sent=1,
+                    access_message_id=$1,
+                    access_status='sent'
+                WHERE yookassa_payment_id=$2""",
+                delivered_message_id,
+                payment_id,
+            )
+
+            return True
 
 
 # ============================================================
@@ -1586,8 +1680,14 @@ async def yookassa_webhook(request: web.Request):
         await notify_success(payment_row)
         payment_row = await get_payment(payment_id)
 
-    if payment_row and not payment_row["refunded"] and not payment_row["access_sent"]:
-        await send_customer_success(payment_row)
+    if payment_row and not payment_row["refunded"]:
+        try:
+            await send_customer_success(payment_id)
+        except Exception:
+            logger.exception("Could not deliver customer access for payment %s", payment_id)
+            # Ask YooKassa to retry the notification. The row lock + in-place
+            # message edit makes a retry safe against duplicate access messages.
+            return web.Response(status=503, text="access delivery failed")
 
     return web.Response(status=200, text="ok")
 
