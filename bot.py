@@ -85,7 +85,7 @@ COURSE2_DESCRIPTION = "Курс с доступом к закрытому Telegr
 COURSE2_ACCESS_DAYS = 30
 COURSE2_REMINDER_DAYS = 3
 COURSE2_INVITE_HOURS = 24
-COURSE2_CHAT_ID = 0  # TODO: ID закрытого Telegram-канала, например -1001234567890
+COURSE2_CHAT_ID = -1004299566966
 
 PRODUCTS = {
     "energy": {
