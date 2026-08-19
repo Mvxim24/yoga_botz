@@ -7,7 +7,7 @@ import os
 import re
 import secrets
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -70,6 +70,23 @@ TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").lower() == "true
 ENERGY_PRICE = 999
 INDIVIDUAL_PRICE = 15000
 
+# ============================================================
+# COURSE 2 — DORMANT FEATURE
+# ============================================================
+# Пока COURSE2_ENABLED = False, третий продукт полностью скрыт:
+# он не отображается в меню и не может быть куплен.
+#
+# Когда курс будет готов, достаточно заполнить этот небольшой блок
+# и переключить COURSE2_ENABLED = True.
+COURSE2_ENABLED = False
+COURSE2_TITLE = "КУРС 2"
+COURSE2_PRICE = 0  # TODO: укажите цену в рублях перед включением
+COURSE2_DESCRIPTION = "Курс с доступом к закрытому Telegram-каналу на 30 дней"
+COURSE2_ACCESS_DAYS = 30
+COURSE2_REMINDER_DAYS = 3
+COURSE2_INVITE_HOURS = 24
+COURSE2_CHAT_ID = 0  # TODO: ID закрытого Telegram-канала, например -1001234567890
+
 PRODUCTS = {
     "energy": {
         "title": "ЭНЕРГОКОМПЛЕКС",
@@ -82,6 +99,13 @@ PRODUCTS = {
         "description": "4 индивидуальных тренировок в месяц",
     },
 }
+
+if COURSE2_ENABLED:
+    PRODUCTS["course2"] = {
+        "title": COURSE2_TITLE,
+        "price": COURSE2_PRICE,
+        "description": COURSE2_DESCRIPTION,
+    }
 
 EMAIL_RE = re.compile(
     r"^(?=.{3,254}$)[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
@@ -115,6 +139,11 @@ if not WEBHOOK_SECRET or len(WEBHOOK_SECRET) < 24:
     raise RuntimeError("WEBHOOK_SECRET must be a long random value (24+ chars)")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is missing in .env")
+if COURSE2_ENABLED:
+    if COURSE2_PRICE <= 0:
+        raise RuntimeError("COURSE2_PRICE must be greater than 0 when COURSE2_ENABLED=True")
+    if not COURSE2_CHAT_ID:
+        raise RuntimeError("COURSE2_CHAT_ID must be set when COURSE2_ENABLED=True")
 
 
 # ============================================================
@@ -157,6 +186,15 @@ INDIVIDUAL_CARD_TEXT = """📚 Продукт: <b>«ИНДИВИДУАЛЬНЫЕ
 4 индивидуальных тренировок в месяц
 Стоимость — 15 000 ₽ в месяц."""
 
+# TODO: замените этот текст перед включением COURSE2_ENABLED.
+COURSE2_TEXT = """🎓 <b>КУРС 2</b>
+
+Здесь будет описание нового курса.
+
+<b>Формат:</b> 5 видео в закрытом Telegram-канале.
+<b>Доступ:</b> 30 дней с момента успешной оплаты.
+<b>Стоимость:</b> укажите цену перед запуском."""
+
 ABOUT_TEXT = """Привет! 👋
 Меня зовут Вера, я сертифицированный йога-тренер.
 
@@ -178,11 +216,18 @@ def legal_text(product_key: str) -> str:
         access = "К папке на Яндекс Диск с тренировками"
         period = "Бессрочный"
         price = "999 RUB"
-    else:
+    elif product_key == "individual":
         product_title = "ИНДИВИДУАЛЬНЫЕ ЗАНЯТИЯ"
         access = "После оплаты я с Вами свяжусь для уточнения графика тренировок."
         period = "4 занятий в месяц"
         price = "15 000 RUB"
+    elif product_key == "course2" and COURSE2_ENABLED:
+        product_title = COURSE2_TITLE
+        access = "К закрытому Telegram-каналу с материалами курса"
+        period = f"{COURSE2_ACCESS_DAYS} дней"
+        price = f"{COURSE2_PRICE:,} RUB".replace(",", " ")
+    else:
+        raise ValueError("Unknown or disabled product")
 
     return f"""📚 Продукт: <b>«{product_title}»</b>
 
@@ -220,12 +265,15 @@ def persistent_keyboard() -> ReplyKeyboardMarkup:
 
 
 def products_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="ЭНЕРГОКОМПЛЕКС", callback_data="product:energy")],
-            [InlineKeyboardButton(text="ИНДИВИДУАЛЬНЫЕ ЗАНЯТИЯ", callback_data="product:individual")],
-        ]
-    )
+    rows = [
+        [InlineKeyboardButton(text="ЭНЕРГОКОМПЛЕКС", callback_data="product:energy")],
+        [InlineKeyboardButton(text="ИНДИВИДУАЛЬНЫЕ ЗАНЯТИЯ", callback_data="product:individual")],
+    ]
+    if COURSE2_ENABLED:
+        rows.append(
+            [InlineKeyboardButton(text=COURSE2_TITLE, callback_data="product:course2")]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def product_keyboard(product_key: str) -> InlineKeyboardMarkup:
@@ -280,10 +328,15 @@ def payment_keyboard(url: str, product_key: str) -> InlineKeyboardMarkup:
     )
 
 
-def after_purchase_keyboard(product_key: str) -> InlineKeyboardMarkup:
+def after_purchase_keyboard(
+    product_key: str,
+    course_invite_url: Optional[str] = None,
+) -> InlineKeyboardMarkup:
     rows = []
     if product_key == "energy" and YANDEX_DISK_URL:
         rows.append([InlineKeyboardButton(text="🧘 Открыть тренировки", url=YANDEX_DISK_URL)])
+    if product_key == "course2" and course_invite_url:
+        rows.append([InlineKeyboardButton(text="🎓 Войти в закрытый канал", url=course_invite_url)])
     rows.append([InlineKeyboardButton(text="💬 Написать Вере", url="https://t.me/veranikkiri")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -347,6 +400,26 @@ WHERE access_sent=1 AND access_status!='sent';
 
 CREATE INDEX IF NOT EXISTS idx_payments_tg ON payments(telegram_id);
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
+
+CREATE TABLE IF NOT EXISTS course_subscriptions (
+    telegram_id BIGINT NOT NULL,
+    product_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    started_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    reminder_sent_at TEXT,
+    declined_renewal_at TEXT,
+    invite_link TEXT,
+    invite_expires_at TEXT,
+    last_payment_id TEXT,
+    removed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (telegram_id, product_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_course_subscriptions_status
+ON course_subscriptions(status);
 """
 
 db_pool: Optional[asyncpg.Pool] = None
@@ -484,6 +557,247 @@ async def clear_payments():
     deleted_count = await db_pool.fetchval("SELECT COUNT(*) FROM payments")
     await db_pool.execute("TRUNCATE TABLE payments RESTART IDENTITY")
     return deleted_count
+
+
+# ============================================================
+# COURSE 2 SUBSCRIPTIONS
+# ============================================================
+
+def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+async def create_course2_invite(telegram_id: int) -> tuple[str, str]:
+    if not COURSE2_ENABLED:
+        raise RuntimeError("Course 2 is disabled")
+
+    # If the user was previously removed after expiration, allow a fresh invite.
+    with suppress(Exception):
+        await bot.unban_chat_member(
+            COURSE2_CHAT_ID,
+            telegram_id,
+            only_if_banned=True,
+        )
+
+    expires_dt = datetime.now(timezone.utc) + timedelta(hours=COURSE2_INVITE_HOURS)
+    invite = await bot.create_chat_invite_link(
+        chat_id=COURSE2_CHAT_ID,
+        name=f"course2-{telegram_id}"[:32],
+        expire_date=int(expires_dt.timestamp()),
+        member_limit=1,
+    )
+    return invite.invite_link, expires_dt.isoformat()
+
+
+async def activate_or_extend_course2_subscription(
+    conn,
+    payment_row,
+) -> tuple[str, str]:
+    telegram_id = payment_row["telegram_id"]
+    now = datetime.now(timezone.utc)
+
+    existing = await conn.fetchrow(
+        """SELECT *
+        FROM course_subscriptions
+        WHERE telegram_id=$1 AND product_key='course2'
+        FOR UPDATE""",
+        telegram_id,
+    )
+
+    current_expiry = parse_iso_datetime(existing["expires_at"]) if existing else None
+    if current_expiry and current_expiry > now:
+        base = current_expiry
+    else:
+        base = now
+
+    new_expiry = base + timedelta(days=COURSE2_ACCESS_DAYS)
+    invite_link, invite_expires_at = await create_course2_invite(telegram_id)
+
+    await conn.execute(
+        """INSERT INTO course_subscriptions(
+            telegram_id, product_key, status, started_at, expires_at,
+            reminder_sent_at, declined_renewal_at, invite_link, invite_expires_at,
+            last_payment_id, removed_at, created_at, updated_at
+        )
+        VALUES ($1,'course2','active',$2,$3,NULL,NULL,$4,$5,$6,NULL,$2,$2)
+        ON CONFLICT (telegram_id, product_key) DO UPDATE SET
+            status='active',
+            expires_at=EXCLUDED.expires_at,
+            reminder_sent_at=NULL,
+            declined_renewal_at=NULL,
+            invite_link=EXCLUDED.invite_link,
+            invite_expires_at=EXCLUDED.invite_expires_at,
+            last_payment_id=EXCLUDED.last_payment_id,
+            removed_at=NULL,
+            updated_at=EXCLUDED.updated_at""",
+        telegram_id,
+        now.isoformat(),
+        new_expiry.isoformat(),
+        invite_link,
+        invite_expires_at,
+        payment_row["yookassa_payment_id"],
+    )
+
+    return invite_link, new_expiry.isoformat()
+
+
+async def get_course2_subscription(telegram_id: int):
+    return await db_pool.fetchrow(
+        """SELECT *
+        FROM course_subscriptions
+        WHERE telegram_id=$1 AND product_key='course2'""",
+        telegram_id,
+    )
+
+
+async def mark_course2_declined(telegram_id: int):
+    await db_pool.execute(
+        """UPDATE course_subscriptions
+        SET declined_renewal_at=$1, updated_at=$1
+        WHERE telegram_id=$2 AND product_key='course2' AND status='active'""",
+        utcnow_iso(),
+        telegram_id,
+    )
+
+
+async def remove_course2_member(telegram_id: int) -> bool:
+    try:
+        await bot.ban_chat_member(
+            chat_id=COURSE2_CHAT_ID,
+            user_id=telegram_id,
+            revoke_messages=True,
+        )
+        # Immediately unban: the user is removed, but can later receive a fresh
+        # personal invite after a new payment. Old one-use/expired links remain useless.
+        await bot.unban_chat_member(
+            chat_id=COURSE2_CHAT_ID,
+            user_id=telegram_id,
+            only_if_banned=True,
+        )
+        return True
+    except Exception:
+        logger.exception("Could not remove Course 2 member %s", telegram_id)
+        return False
+
+
+async def expire_course2_subscription(telegram_id: int) -> bool:
+    removed = await remove_course2_member(telegram_id)
+    if not removed:
+        return False
+
+    now = utcnow_iso()
+    result = await db_pool.execute(
+        """UPDATE course_subscriptions
+        SET status='expired', removed_at=$1, updated_at=$1
+        WHERE telegram_id=$2 AND product_key='course2' AND status='active'""",
+        now,
+        telegram_id,
+    )
+    return result == "UPDATE 1"
+
+
+async def revoke_course2_subscription_for_refund(telegram_id: int):
+    if not COURSE2_ENABLED:
+        return False
+
+    removed = await remove_course2_member(telegram_id)
+    now = utcnow_iso()
+    await db_pool.execute(
+        """UPDATE course_subscriptions
+        SET status='cancelled', removed_at=$1, updated_at=$1
+        WHERE telegram_id=$2 AND product_key='course2'""",
+        now,
+        telegram_id,
+    )
+    return removed
+
+
+def renewal_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Продлить на 30 дней", callback_data="course2_renew")],
+            [InlineKeyboardButton(text="❌ Не продлевать", callback_data="course2_decline")],
+        ]
+    )
+
+
+async def process_course2_subscriptions():
+    if not COURSE2_ENABLED:
+        return
+
+    rows = await db_pool.fetch(
+        """SELECT *
+        FROM course_subscriptions
+        WHERE product_key='course2' AND status='active'"""
+    )
+
+    now = datetime.now(timezone.utc)
+    reminder_threshold = now + timedelta(days=COURSE2_REMINDER_DAYS)
+
+    for row in rows:
+        expires_at = parse_iso_datetime(row["expires_at"])
+        if not expires_at:
+            continue
+
+        if expires_at <= now:
+            expired = await expire_course2_subscription(row["telegram_id"])
+            if expired:
+                with suppress(Exception):
+                    await bot.send_message(
+                        row["telegram_id"],
+                        f"⏳ Доступ к <b>{html.escape(COURSE2_TITLE)}</b> завершён.\n\n"
+                        "Если захотите вернуться, доступ можно приобрести снова.",
+                        parse_mode=ParseMode.HTML,
+                    )
+            continue
+
+        if (
+            expires_at <= reminder_threshold
+            and not row["reminder_sent_at"]
+            and not row["declined_renewal_at"]
+        ):
+            expires_text = expires_at.astimezone().strftime("%d.%m.%Y %H:%M")
+            try:
+                await bot.send_message(
+                    row["telegram_id"],
+                    f"⏰ Доступ к <b>{html.escape(COURSE2_TITLE)}</b> закончится "
+                    f"<b>{html.escape(expires_text)}</b>.\n\n"
+                    "Хотите продлить доступ ещё на 30 дней?",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=renewal_keyboard(),
+                )
+                await db_pool.execute(
+                    """UPDATE course_subscriptions
+                    SET reminder_sent_at=$1, updated_at=$1
+                    WHERE telegram_id=$2 AND product_key='course2'""",
+                    utcnow_iso(),
+                    row["telegram_id"],
+                )
+            except Exception:
+                logger.exception(
+                    "Could not send Course 2 renewal reminder to %s",
+                    row["telegram_id"],
+                )
+
+
+async def course2_subscription_worker():
+    if not COURSE2_ENABLED:
+        return
+
+    while True:
+        try:
+            await process_course2_subscriptions()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Course 2 subscription worker failed")
+
+        await asyncio.sleep(3600)
 
 
 # ============================================================
@@ -716,7 +1030,13 @@ async def product_handler(query: CallbackQuery, state: FSMContext):
         await query.answer("Неизвестный продукт", show_alert=True)
         return
 
-    text = ENERGY_TEXT if key == "energy" else INDIVIDUAL_TEXT
+    if key == "energy":
+        text = ENERGY_TEXT
+    elif key == "individual":
+        text = INDIVIDUAL_TEXT
+    else:
+        text = COURSE2_TEXT
+
     await safe_edit(query, text, product_keyboard(key))
     await query.answer()
 
@@ -936,6 +1256,61 @@ async def my_purchases_handler(message: Message):
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+@router.message(Command("chatid"))
+async def chatid_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    replied = message.reply_to_message
+    if not replied:
+        await message.answer(
+            "Перешлите любое сообщение из закрытого канала в этот чат, "
+            "затем ответьте на пересланное сообщение командой /chatid."
+        )
+        return
+
+    channel_chat = None
+
+    # Aiogram / Telegram Bot API current format.
+    origin = getattr(replied, "forward_origin", None)
+    if origin is not None:
+        channel_chat = getattr(origin, "chat", None)
+
+    # Compatibility with older Telegram message fields.
+    if channel_chat is None:
+        channel_chat = getattr(replied, "forward_from_chat", None)
+
+    if channel_chat is None:
+        await message.answer(
+            "Не удалось определить канал из этого сообщения.\n\n"
+            "Убедитесь, что это именно пересланный пост из канала и "
+            "ответьте на него командой /chatid."
+        )
+        return
+
+    chat_type = getattr(channel_chat, "type", None)
+    chat_type_value = getattr(chat_type, "value", str(chat_type))
+
+    if chat_type_value != "channel":
+        await message.answer(
+            f"Найден чат, но это не канал.\n"
+            f"Chat ID: <code>{channel_chat.id}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    title = getattr(channel_chat, "title", None) or "без названия"
+
+    await message.answer(
+        "✅ <b>Канал найден</b>\n\n"
+        f"Название: {html.escape(title)}\n"
+        f"COURSE2_CHAT_ID = <code>{channel_chat.id}</code>\n\n"
+        "Скопируйте это число — его нужно будет поставить "
+        "в COURSE2_CHAT_ID перед запуском курса.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(Command("buyers"))
@@ -1286,6 +1661,18 @@ async def refund_confirm_handler(callback: CallbackQuery):
         access_deleted,
     )
 
+    course2_refund_note = ""
+    if updated and payment_row["product_key"] == "course2" and COURSE2_ENABLED:
+        removed_from_course = await revoke_course2_subscription_for_refund(
+            payment_row["telegram_id"]
+        )
+        course2_refund_note = (
+            "\n✅ Доступ к закрытому каналу отозван."
+            if removed_from_course
+            else "\n⚠️ Возврат отмечен, но автоматически удалить пользователя "
+                 "из закрытого канала не удалось."
+        )
+
     if not updated:
         await callback.message.edit_text(
             "❌ Не удалось отметить возврат. Возможно, запись уже была изменена."
@@ -1298,7 +1685,7 @@ async def refund_confirm_handler(callback: CallbackQuery):
         f"📚 {html.escape(payment_row['product_title'])}\n"
         f"👤 {html.escape(payment_row['full_name'] or 'не указано')}\n"
         f"💳 Payment ID: <code>{html.escape(payment_id)}</code>\n\n"
-        f"{delete_note}",
+        f"{delete_note}{course2_refund_note}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1375,6 +1762,47 @@ async def cancel_clear_payments(callback: CallbackQuery):
         "❌ Очистка отменена."
     )
     await callback.answer()
+@router.callback_query(F.data == "course2_renew")
+async def course2_renew_handler(query: CallbackQuery, state: FSMContext):
+    if not COURSE2_ENABLED:
+        await query.answer("Курс пока недоступен.", show_alert=True)
+        return
+
+    await state.clear()
+    await safe_edit(query, legal_text("course2"), details_keyboard("course2"))
+    await query.answer()
+
+
+@router.callback_query(F.data == "course2_decline")
+async def course2_decline_handler(query: CallbackQuery):
+    if not COURSE2_ENABLED:
+        await query.answer()
+        return
+
+    subscription = await get_course2_subscription(query.from_user.id)
+    if not subscription or subscription["status"] != "active":
+        await query.message.edit_text("Действующая подписка не найдена.")
+        await query.answer()
+        return
+
+    await mark_course2_declined(query.from_user.id)
+    expires_at = parse_iso_datetime(subscription["expires_at"])
+    expires_text = (
+        expires_at.astimezone().strftime("%d.%m.%Y %H:%M")
+        if expires_at
+        else subscription["expires_at"]
+    )
+
+    await query.message.edit_text(
+        f"✅ Продление отключено.\n\n"
+        f"Доступ к <b>{html.escape(COURSE2_TITLE)}</b> сохранится до "
+        f"<b>{html.escape(expires_text)}</b>.\n\n"
+        "Никаких автоматических списаний не будет.",
+        parse_mode=ParseMode.HTML,
+    )
+    await query.answer("Продление отключено")
+
+
 @router.message()
 async def fallback_handler(message: Message):
     # Avoid noisy responses to arbitrary spam while preserving navigation.
@@ -1478,8 +1906,34 @@ async def send_customer_success(payment_id: str):
             tg_id = payment_row["telegram_id"]
             product_key = payment_row["product_key"]
             escaped_payment_id = html.escape(payment_row["yookassa_payment_id"])
+            course_invite_url = None
 
-            if product_key == "energy":
+            if product_key == "course2":
+                course_invite_url, course_expires_at = await activate_or_extend_course2_subscription(
+                    conn,
+                    payment_row,
+                )
+                course_expiry_dt = parse_iso_datetime(course_expires_at)
+                course_expiry_text = (
+                    course_expiry_dt.astimezone().strftime("%d.%m.%Y %H:%M")
+                    if course_expiry_dt
+                    else course_expires_at
+                )
+                success_text = f"""✅ <b>Платёж принят!</b>
+
+🆔 <b>Payment ID:</b>
+<code>{escaped_payment_id}</code>
+
+Спасибо за покупку <b>{html.escape(COURSE2_TITLE)}</b>!
+
+🎓 Доступ к закрытому Telegram-каналу активирован на {COURSE2_ACCESS_DAYS} дней.
+📅 Доступ действует до: <b>{html.escape(course_expiry_text)}</b>.
+
+Нажмите кнопку ниже, чтобы войти в канал.
+Персональная ссылка действует {COURSE2_INVITE_HOURS} ч.
+
+📧 Чек будет отправлен Вам на указанную электронную почту в ближайшее время."""
+            elif product_key == "energy":
                 if YANDEX_DISK_URL:
                     success_text = f"""✅ <b>Платёж принят!</b>
 
@@ -1505,7 +1959,7 @@ async def send_customer_success(payment_id: str):
 📧 Чек будет отправлен Вам на указанную электронную почту в ближайшее время.
 
 Ссылка на материалы временно не настроена. Напишите @veranikkiri, и я отправлю доступ вручную."""
-            else:
+            elif product_key == "individual":
                 success_text = f"""✅ <b>Платёж принят!</b>
 
 🆔 <b>Payment ID:</b>
@@ -1516,6 +1970,8 @@ async def send_customer_success(payment_id: str):
 В ближайшее время я с Вами свяжусь для согласования графика индивидуальных тренировок.
 
 Если возникнут вопросы, укажите Payment ID — так я смогу быстрее найти Ваш платёж."""
+            else:
+                raise RuntimeError("Unknown product during access delivery")
 
             delivered_message_id = None
             checkout_message_id = payment_row["checkout_message_id"]
@@ -1528,7 +1984,7 @@ async def send_customer_success(payment_id: str):
                         text=success_text,
                         parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True,
-                        reply_markup=after_purchase_keyboard(product_key),
+                        reply_markup=after_purchase_keyboard(product_key, course_invite_url),
                     )
                     delivered_message_id = checkout_message_id
                 except Exception as exc:
@@ -1550,7 +2006,7 @@ async def send_customer_success(payment_id: str):
                             success_text,
                             parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True,
-                            reply_markup=after_purchase_keyboard(product_key),
+                            reply_markup=after_purchase_keyboard(product_key, course_invite_url),
                         )
                         delivered_message_id = sent_message.message_id
                     else:
@@ -1562,7 +2018,7 @@ async def send_customer_success(payment_id: str):
                     success_text,
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
-                    reply_markup=after_purchase_keyboard(product_key),
+                    reply_markup=after_purchase_keyboard(product_key, course_invite_url),
                 )
                 delivered_message_id = sent_message.message_id
 
@@ -1720,6 +2176,7 @@ async def main():
     admin_commands = [
         BotCommand(command="start", description="Открыть меню"),
         BotCommand(command="buyers", description="Таблица покупателей"),
+        BotCommand(command="chatid", description="Узнать ID закрытого канала"),
         BotCommand(command="stats", description="Статистика продаж"),
         BotCommand(command="receipt", description="Отметить чек отправленным"),
         BotCommand(command="refund", description="Отметить возврат"),
@@ -1745,6 +2202,10 @@ async def main():
 
     runner = await start_http_server()
 
+    course2_task = None
+    if COURSE2_ENABLED:
+        course2_task = asyncio.create_task(course2_subscription_worker())
+
     try:
         await dp.start_polling(
             bot,
@@ -1752,6 +2213,10 @@ async def main():
             close_bot_session=False,
         )
     finally:
+        if course2_task:
+            course2_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await course2_task
         await runner.cleanup()
         await bot.session.close()
         if db_pool:
